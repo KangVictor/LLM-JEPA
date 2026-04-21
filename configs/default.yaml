@@ -1,0 +1,60 @@
+# SentenceJEPA-Small default configuration
+
+# Sentence encoder (BERT-style)
+encoder:
+  num_layers: 4
+  hidden_size: 256
+  num_heads: 4
+  ffn_size: 1024
+  max_seq_len: 48
+  vocab_size: 30522  # BERT tokenizer vocab
+  dropout: 0.1
+
+# Sentence-level predictor
+predictor:
+  num_layers: 2       # ablation: 1 vs 2
+  hidden_size: 256
+  num_heads: 4
+  ffn_size: 1024
+
+# Data pipeline
+data:
+  dataset: "wikimedia/wikipedia"
+  config: "20231101.en"
+  min_sentences: 4
+  max_sentences: 12
+  max_tokens_per_sentence: 48
+  tokenizer: "bert-base-uncased"
+  num_workers: 4
+
+# JEPA masking
+masking:
+  mask_ratio_min: 0.25   # ablation: 0.25 vs 0.40
+  mask_ratio_max: 0.40
+  max_mask_count: 4
+  multi_mask: true        # ablation: true vs false
+
+# SIGReg regularization
+sigreg:
+  enabled: true           # ablation: true vs false
+  num_projections: 64
+  weight: 0.1
+
+# Training
+training:
+  batch_size: 64
+  lr: 3.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 100000
+  precision: "bf16"
+  grad_clip: 1.0
+  log_every: 50
+  save_every: 5000
+  checkpoint_dir: "checkpoints"
+  seed: 42
+
+# Weights & Biases
+wandb:
+  project: "sentence-jepa"
+  enabled: true
