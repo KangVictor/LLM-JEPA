@@ -2,7 +2,7 @@ import re
 
 import torch
 from torch.utils.data import IterableDataset
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
 
 
@@ -34,16 +34,10 @@ class WikiParagraphDataset(IterableDataset):
         """Load dataset from local path or HuggingFace Hub."""
         local_path = self.data_cfg.get("local_path")
         if local_path:
-            # Pre-downloaded dataset: load from disk or local files
-            ds = load_dataset(
-                local_path,
-                split="train",
-                trust_remote_code=True,
-            )
-            # Convert to iterable for consistent interface
-            streaming = self.data_cfg.get("streaming", True)
-            if streaming:
-                ds = ds.to_iterable_dataset()
+            # Pre-downloaded dataset saved with save_to_disk()
+            ds = load_from_disk(local_path)
+            # Convert to iterable for consistent streaming interface
+            ds = ds.to_iterable_dataset()
         else:
             ds = load_dataset(
                 self.data_cfg["dataset"],
