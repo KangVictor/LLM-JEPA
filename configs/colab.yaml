@@ -55,7 +55,7 @@ training:
   val_every: 500
   log_every: 50
   save_every: 5000
-  checkpoint_dir: "checkpoints"
+  checkpoint_dir: "/content/drive/MyDrive/SentenceJEPAModel"
   seed: 42
 
 # Weights & Biases

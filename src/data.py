@@ -17,6 +17,96 @@ def split_sentences(text):
     return [s.strip() for s in sentences if len(s.strip()) >= 3]
 
 
+def summarize_dataset(cfg):
+    """Scan the dataset, print summary stats, and collect a validation set.
+
+    Returns:
+        num_paragraphs: total qualifying paragraph count (excluding val)
+        val_samples: list of tokenized val samples (dicts with input_ids, num_sentences)
+    """
+    print("Scanning dataset for summary statistics...")
+    data_cfg = cfg["data"]
+    local_path = data_cfg.get("local_path")
+    if local_path:
+        ds = load_from_disk(local_path)
+    else:
+        ds = load_dataset(
+            data_cfg["dataset"],
+            data_cfg["config"],
+            streaming=True,
+            split="train",
+            trust_remote_code=True,
+        )
+
+    min_sent = data_cfg["min_sentences"]
+    max_sent = data_cfg["max_sentences"]
+    max_tokens = data_cfg["max_tokens_per_sentence"]
+    val_size = cfg["training"].get("val_paragraphs", 1000)
+
+    tokenizer = AutoTokenizer.from_pretrained(data_cfg["tokenizer"], use_fast=True)
+
+    num_articles = 0
+    num_paragraphs = 0
+    sentence_counts = []
+    val_samples = []
+
+    for article in ds:
+        num_articles += 1
+        text = article["text"]
+        paragraphs = re.split(r'\n\n+', text)
+        for para in paragraphs:
+            para = para.strip()
+            if len(para) < 20:
+                continue
+            sentences = split_sentences(para)
+            n = len(sentences)
+            if n < min_sent:
+                continue
+            sentences = sentences[:max_sent]
+            n = len(sentences)
+            num_paragraphs += 1
+            sentence_counts.append(n)
+
+            # Collect validation samples from the tail of the scan
+            if len(val_samples) < val_size:
+                encoded = tokenizer(
+                    sentences,
+                    padding=False,
+                    truncation=True,
+                    max_length=max_tokens,
+                    return_attention_mask=False,
+                )
+                val_samples.append({
+                    "input_ids": encoded["input_ids"],
+                    "num_sentences": len(encoded["input_ids"]),
+                })
+
+        if num_articles % 100_000 == 0:
+            print(f"  ...scanned {num_articles:,} articles, {num_paragraphs:,} paragraphs so far")
+
+    # Exclude val from training count
+    num_train = num_paragraphs - len(val_samples)
+
+    sentence_counts_t = torch.tensor(sentence_counts, dtype=torch.float32)
+    batch_size = cfg["training"]["batch_size"]
+    steps_per_epoch = num_train // batch_size
+
+    print(f"\n{'='*50}")
+    print(f"Dataset Summary")
+    print(f"{'='*50}")
+    print(f"Articles:           {num_articles:,}")
+    print(f"Qualifying paras:   {num_paragraphs:,}")
+    print(f"  Train:            {num_train:,}")
+    print(f"  Val:              {len(val_samples):,}")
+    print(f"Sentences/para:     mean={sentence_counts_t.mean():.1f}, "
+          f"min={sentence_counts_t.min().long().item()}, "
+          f"max={sentence_counts_t.max().long().item()}")
+    print(f"Steps/epoch (bs={batch_size}): {steps_per_epoch:,}")
+    print(f"{'='*50}\n")
+
+    return num_train, val_samples
+
+
 class WikiParagraphDataset(IterableDataset):
     """Streams Wikipedia paragraphs as bags of tokenized sentences."""
 

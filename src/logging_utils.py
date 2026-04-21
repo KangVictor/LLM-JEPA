@@ -101,3 +101,31 @@ def log_step(step, losses, metrics, mask_counts, wandb_run):
         if "emb/cosine_sim_mean" in metrics:
             loss_str += f" | cos={metrics['emb/cosine_sim_mean']:.3f}"
         print(loss_str)
+
+
+def log_val(step, losses, metrics, wandb_run):
+    """Log validation metrics to wandb.
+
+    Args:
+        step: training step
+        losses: dict with total, prediction, sigreg (averaged over val set)
+        metrics: dict from compute_metrics
+        wandb_run: wandb run object (or None if disabled)
+    """
+    log_dict = {
+        "val/loss_total": losses["total"],
+        "val/loss_prediction": losses["prediction"],
+        "val/loss_sigreg": losses["sigreg"],
+    }
+    for k, v in metrics.items():
+        log_dict[f"val/{k}"] = v
+
+    if wandb_run is not None:
+        wandb_run.log(log_dict, step=step)
+    else:
+        print(
+            f"  [val] step={step} | "
+            f"loss={losses['total']:.4f} "
+            f"pred={losses['prediction']:.4f} "
+            f"sig={losses['sigreg']:.4f}"
+        )
