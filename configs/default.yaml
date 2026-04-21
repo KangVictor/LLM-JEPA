@@ -21,6 +21,8 @@ predictor:
 data:
   dataset: "wikimedia/wikipedia"
   config: "20231101.en"
+  local_path: null            # set to a directory or file path to use pre-downloaded data
+  streaming: true             # ignored when local_path is set
   min_sentences: 4
   max_sentences: 12
   max_tokens_per_sentence: 48

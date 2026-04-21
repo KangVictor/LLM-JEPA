@@ -30,14 +30,32 @@ class WikiParagraphDataset(IterableDataset):
             self.data_cfg["tokenizer"], use_fast=True
         )
 
+    def _load_dataset(self):
+        """Load dataset from local path or HuggingFace Hub."""
+        local_path = self.data_cfg.get("local_path")
+        if local_path:
+            # Pre-downloaded dataset: load from disk or local files
+            ds = load_dataset(
+                local_path,
+                split="train",
+                trust_remote_code=True,
+            )
+            # Convert to iterable for consistent interface
+            streaming = self.data_cfg.get("streaming", True)
+            if streaming:
+                ds = ds.to_iterable_dataset()
+        else:
+            ds = load_dataset(
+                self.data_cfg["dataset"],
+                self.data_cfg["config"],
+                streaming=self.data_cfg.get("streaming", True),
+                split="train",
+                trust_remote_code=True,
+            )
+        return ds
+
     def _stream_paragraphs(self):
-        ds = load_dataset(
-            self.data_cfg["dataset"],
-            self.data_cfg["config"],
-            streaming=True,
-            split="train",
-            trust_remote_code=True,
-        )
+        ds = self._load_dataset()
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
             # Shard the stream across workers
