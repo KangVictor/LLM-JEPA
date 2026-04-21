@@ -55,7 +55,7 @@ training:
   val_paragraphs: 1000
   val_every: 500
   log_every: 50
-  save_every: 5000
+  save_every: 1000
   checkpoint_dir: "checkpoints"
   seed: 42
 
