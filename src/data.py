@@ -36,8 +36,9 @@ class WikiParagraphDataset(IterableDataset):
         if local_path:
             # Pre-downloaded dataset saved with save_to_disk()
             ds = load_from_disk(local_path)
-            # Convert to iterable for consistent streaming interface
-            ds = ds.to_iterable_dataset()
+            # Convert to iterable with enough shards for multi-worker loading
+            num_shards = max(self.data_cfg.get("num_workers", 4), 1)
+            ds = ds.to_iterable_dataset(num_shards=num_shards)
         else:
             ds = load_dataset(
                 self.data_cfg["dataset"],
