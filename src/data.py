@@ -1,7 +1,8 @@
+import os
 import re
 
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset, IterableDataset
 from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
 
@@ -177,6 +178,51 @@ class WikiParagraphDataset(IterableDataset):
                 "input_ids": input_ids,
                 "num_sentences": len(input_ids),
             }
+
+
+class PreprocessedDataset(Dataset):
+    """Map-style dataset backed by a pre-processed .pt file."""
+
+    def __init__(self, samples):
+        self.samples = samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+def load_preprocessed(cfg):
+    """Load pre-processed train/val splits and metadata.
+
+    Returns:
+        train_dataset: PreprocessedDataset
+        val_samples: list of dicts
+        num_train: int
+    """
+    path = cfg["data"]["preprocessed_path"]
+    print(f"Loading preprocessed data from {path}/...")
+
+    train_samples = torch.load(os.path.join(path, "train.pt"), weights_only=False)
+    val_samples = torch.load(os.path.join(path, "val.pt"), weights_only=False)
+    meta = torch.load(os.path.join(path, "meta.pt"), weights_only=False)
+
+    batch_size = cfg["training"]["batch_size"]
+    steps_per_epoch = len(train_samples) // batch_size
+
+    print(f"\n{'='*50}")
+    print(f"Preprocessed Dataset Summary")
+    print(f"{'='*50}")
+    for k, v in meta.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.1f}")
+        else:
+            print(f"  {k}: {v:,}")
+    print(f"  Steps/epoch (bs={batch_size}): {steps_per_epoch:,}")
+    print(f"{'='*50}\n")
+
+    return PreprocessedDataset(train_samples), val_samples, len(train_samples)
 
 
 def collate_fn(batch):

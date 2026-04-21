@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 
-from src.data import WikiParagraphDataset, collate_fn, summarize_dataset
+from src.data import WikiParagraphDataset, collate_fn, summarize_dataset, load_preprocessed
 from src.logging_utils import compute_metrics, log_step, log_val
 from src.masking import sample_masks
 from src.model import SentenceJEPA
@@ -162,23 +162,35 @@ def main():
             config=cfg,
         )
 
-    # Dataset summary + validation set
-    num_train, val_samples = summarize_dataset(cfg)
+    # Load data — preprocessed (fast) or raw (streaming)
     batch_size = train_cfg["batch_size"]
+
+    if cfg["data"].get("preprocessed_path"):
+        train_dataset, val_samples, num_train = load_preprocessed(cfg)
+        loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            shuffle=True,
+            num_workers=cfg["data"]["num_workers"],
+            pin_memory=True,
+            drop_last=True,
+        )
+    else:
+        num_train, val_samples = summarize_dataset(cfg)
+        dataset = WikiParagraphDataset(cfg)
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=cfg["data"]["num_workers"],
+            pin_memory=True,
+            drop_last=True,
+        )
+
     steps_per_epoch = num_train // batch_size
     num_epochs = train_cfg["epochs"]
     total_steps = steps_per_epoch * num_epochs
-
-    # Data
-    dataset = WikiParagraphDataset(cfg)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        collate_fn=collate_fn,
-        num_workers=cfg["data"]["num_workers"],
-        pin_memory=True,
-        drop_last=True,
-    )
 
     # Validation loader (in-memory, fixed set)
     val_loader = DataLoader(
