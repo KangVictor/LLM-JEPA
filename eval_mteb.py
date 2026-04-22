@@ -16,6 +16,7 @@ import json
 import os
 
 import mteb
+from mteb.encoder_interface import Encoder
 import numpy as np
 import torch
 import yaml
@@ -24,10 +25,11 @@ from transformers import AutoTokenizer
 from src.model import SentenceEncoder
 
 
-class SentenceJEPAWrapper:
+class SentenceJEPAWrapper(Encoder):
     """Wraps the SentenceEncoder for MTEB evaluation."""
 
     def __init__(self, cfg, checkpoint_path, device="cuda", batch_size=64):
+        super().__init__()
         self.device = torch.device(device)
         self.batch_size = batch_size
         self.max_length = cfg["encoder"]["max_seq_len"]
