@@ -12,6 +12,8 @@ Usage:
 """
 
 import argparse
+import json
+import os
 
 import mteb
 import numpy as np
@@ -102,12 +104,25 @@ def main():
     tasks = mteb.get_tasks(tasks=[args.task])
     print(f"\nRunning MTEB task: {args.task}")
 
-    evaluation = mteb.MTEB(tasks=tasks)
-    results = evaluation.run(
+    results = mteb.evaluate(
         model,
-        output_folder=args.output,
+        tasks=tasks,
         encode_kwargs={"batch_size": args.batch_size},
     )
+
+    # Save results
+    os.makedirs(args.output, exist_ok=True)
+    output_path = os.path.join(args.output, f"{args.task}.json")
+
+    results_serializable = []
+    for task_result in results:
+        results_serializable.append({
+            "task_name": task_result.task_name,
+            "scores": task_result.scores,
+        })
+
+    with open(output_path, "w") as f:
+        json.dump(results_serializable, f, indent=2, default=str)
 
     # Print results summary
     print(f"\n{'='*50}")
@@ -119,7 +134,7 @@ def main():
                 main_score = score_set.get("main_score", None)
                 if main_score is not None:
                     print(f"  {split}: main_score = {main_score:.4f}")
-    print(f"Full results saved to {args.output}/")
+    print(f"Saved to {output_path}")
     print(f"{'='*50}")
 
 
