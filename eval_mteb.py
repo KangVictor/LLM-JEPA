@@ -27,17 +27,7 @@ from src.model import SentenceEncoder
 
 
 class SentenceJEPAWrapper:
-    """Wraps the SentenceEncoder for MTEB evaluation."""
-
-    mteb_model_meta = ModelMeta.create_empty(overwrites={
-        "name": "SentenceJEPA-Small",
-        "revision": "1",
-        "framework": ["PyTorch"],
-        "embed_dim": 256,
-        "max_tokens": 48,
-        "similarity_fn_name": "cosine",
-        "open_weights": True,
-    })
+    """Wraps the SentenceEncoder for MTEB evaluation, implementing EncoderProtocol."""
 
     def __init__(self, cfg, checkpoint_path, device="cuda", batch_size=64):
         self.device = torch.device(device)
@@ -63,12 +53,27 @@ class SentenceJEPAWrapper:
             cfg["data"]["tokenizer"], use_fast=True
         )
 
+        self._mteb_model_meta = ModelMeta.create_empty(overwrites={
+            "name": "SentenceJEPA-Small",
+            "revision": "1",
+            "framework": ["PyTorch"],
+            "embed_dim": cfg["encoder"]["hidden_size"],
+            "max_tokens": cfg["encoder"]["max_seq_len"],
+            "similarity_fn_name": "cosine",
+            "open_weights": True,
+        })
+
         step = ckpt.get("step", "?")
         print(f"Loaded encoder from {checkpoint_path} (step {step})")
+
+    @property
+    def mteb_model_meta(self) -> ModelMeta:
+        return self._mteb_model_meta
 
     def encode(
         self,
         inputs,
+        *,
         task_metadata=None,
         hf_split=None,
         hf_subset=None,
@@ -108,6 +113,22 @@ class SentenceJEPAWrapper:
             all_embeddings.append(emb.squeeze(1).float().cpu().numpy())
 
         return np.concatenate(all_embeddings, axis=0)
+
+    def similarity(self, embeddings1: Array, embeddings2: Array) -> Array:
+        """Compute cosine similarity between two sets of embeddings."""
+        e1 = torch.from_numpy(np.asarray(embeddings1, dtype=np.float32))
+        e2 = torch.from_numpy(np.asarray(embeddings2, dtype=np.float32))
+        e1 = torch.nn.functional.normalize(e1, dim=1)
+        e2 = torch.nn.functional.normalize(e2, dim=1)
+        return (e1 @ e2.T).numpy()
+
+    def similarity_pairwise(self, embeddings1: Array, embeddings2: Array) -> Array:
+        """Compute pairwise cosine similarity."""
+        e1 = torch.from_numpy(np.asarray(embeddings1, dtype=np.float32))
+        e2 = torch.from_numpy(np.asarray(embeddings2, dtype=np.float32))
+        e1 = torch.nn.functional.normalize(e1, dim=1)
+        e2 = torch.nn.functional.normalize(e2, dim=1)
+        return (e1 * e2).sum(dim=1).numpy()
 
 
 def main():
