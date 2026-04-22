@@ -95,8 +95,14 @@ class SentenceJEPAWrapper:
         all_embeddings = []
 
         for batch in inputs:
+            # batch is a TypedDict: TextInput{"text": list[str]},
+            # CorpusInput{"text": ..., "title": ..., "body": ...},
+            # or QueryInput{"text": ..., "query": ...}
+            # "text" is always present and is the primary field
+            sentences = batch["text"]
+
             encoded = self.tokenizer(
-                batch,
+                sentences,
                 padding=True,
                 truncation=True,
                 max_length=self.max_length,
