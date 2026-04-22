@@ -16,6 +16,7 @@ import json
 import os
 
 import mteb
+from mteb.models.model_meta import ModelMeta
 from mteb.types import PromptType, Array
 import numpy as np
 import torch
@@ -27,6 +28,13 @@ from src.model import SentenceEncoder
 
 class SentenceJEPAWrapper:
     """Wraps the SentenceEncoder for MTEB evaluation."""
+
+    mteb_model_meta = ModelMeta(
+        name="SentenceJEPA-Small",
+        revision="1",
+        release_date=None,
+        languages=["eng-Latn"],
+    )
 
     def __init__(self, cfg, checkpoint_path, device="cuda", batch_size=64):
         self.device = torch.device(device)
