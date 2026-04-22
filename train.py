@@ -11,7 +11,7 @@ from src.data import WikiParagraphDataset, collate_fn, summarize_dataset, load_p
 from src.logging_utils import compute_metrics, log_step, log_val
 from src.masking import sample_masks
 from src.model import SentenceJEPA
-from src.sigreg import sigreg_loss
+from src.sigreg import SIGReg
 
 
 def load_config(args):
@@ -81,7 +81,7 @@ def save_checkpoint(model, optimizer, scheduler, step, cfg):
 
 
 @torch.no_grad()
-def validate(model, val_loader, cfg, device, amp_dtype, use_amp):
+def validate(model, val_loader, cfg, device, amp_dtype, use_amp, sigreg=None):
     """Run validation and return averaged losses + metrics."""
     model.eval()
     total_pred, total_sig, total_loss, num_batches = 0.0, 0.0, 0.0, 0
@@ -104,9 +104,9 @@ def validate(model, val_loader, cfg, device, amp_dtype, use_amp):
             )
             loss_pred = F.mse_loss(pred_out, targets)
 
-            if cfg["sigreg"]["enabled"]:
+            if sigreg is not None:
                 real_embs = enc_out[sentence_mask]
-                loss_sig = sigreg_loss(real_embs, cfg["sigreg"]["num_projections"])
+                loss_sig = sigreg(real_embs)
                 loss_total = loss_pred + cfg["sigreg"]["weight"] * loss_sig
             else:
                 loss_sig = torch.tensor(0.0, device=device)
@@ -205,6 +205,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SentenceJEPA(cfg).to(device)
 
+    # SIGReg module (buffers need to be on device)
+    sigreg = SIGReg(num_projections=cfg["sigreg"]["num_projections"]).to(device) if cfg["sigreg"]["enabled"] else None
+
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
 
@@ -255,9 +258,9 @@ def main():
                 )
                 loss_pred = F.mse_loss(pred_out, targets)
 
-                if cfg["sigreg"]["enabled"]:
+                if sigreg is not None:
                     real_embs = enc_out[sentence_mask]  # (N, H)
-                    loss_sig = sigreg_loss(real_embs, cfg["sigreg"]["num_projections"])
+                    loss_sig = sigreg(real_embs)
                     loss_total = loss_pred + cfg["sigreg"]["weight"] * loss_sig
                 else:
                     loss_sig = torch.tensor(0.0, device=device)
@@ -283,7 +286,7 @@ def main():
             # Validation
             if step > 0 and step % train_cfg["val_every"] == 0:
                 val_result = validate(
-                    model, val_loader, cfg, device, amp_dtype, use_amp
+                    model, val_loader, cfg, device, amp_dtype, use_amp, sigreg
                 )
                 if val_result is not None:
                     val_losses, val_metrics = val_result
@@ -296,7 +299,7 @@ def main():
             step += 1
 
         # End-of-epoch validation + checkpoint
-        val_result = validate(model, val_loader, cfg, device, amp_dtype, use_amp)
+        val_result = validate(model, val_loader, cfg, device, amp_dtype, use_amp, sigreg)
         if val_result is not None:
             val_losses, val_metrics = val_result
             log_val(step, val_losses, val_metrics, wandb_run)

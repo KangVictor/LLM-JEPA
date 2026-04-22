@@ -40,7 +40,7 @@ masking:
 # SIGReg regularization
 sigreg:
   enabled: true           # ablation: true vs false
-  num_projections: 64
+  num_projections: 1024
   weight: 0.1
 
 # Training

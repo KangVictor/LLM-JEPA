@@ -1,48 +1,62 @@
-import math
 import torch
+import torch.nn as nn
 
 
-def sigreg_loss(embeddings, num_projections=64):
-    """SIGReg: enforce Gaussianity of random 1D projections.
+class SIGReg(nn.Module):
+    """Sketch Isotropic Gaussian Regularizer.
 
-    Projects embeddings onto random directions and penalizes deviation
-    from a standard normal distribution using sorted-quantile MSE.
+    Uses the Epps-Pulley characteristic function test to enforce that
+    random 1D projections of embeddings follow N(0,1). Based on the
+    Le-WM implementation (https://github.com/lucas-maes/le-wm).
 
-    Args:
-        embeddings: (N, D) tensor of sentence embeddings (real sentences only)
-        num_projections: number of random projection directions
-
-    Returns:
-        loss: scalar — mean squared deviation from normal quantiles
+    This tests both shape AND scale — collapsed embeddings (near-zero
+    variance) will produce a high loss because their characteristic
+    function won't match the Gaussian one.
     """
-    N, D = embeddings.shape
-    if N < 2:
-        return embeddings.new_tensor(0.0)
 
-    device = embeddings.device
+    def __init__(self, knots=17, num_projections=1024):
+        super().__init__()
+        self.num_projections = num_projections
+        t = torch.linspace(0, 3, knots, dtype=torch.float32)
+        dt = 3 / (knots - 1)
+        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        window = torch.exp(-t.square() / 2.0)
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)
+        self.register_buffer("weights", weights * window)
 
-    # Random unit projection directions
-    directions = torch.randn(D, num_projections, device=device)
-    directions = directions / directions.norm(dim=0, keepdim=True)
+    def forward(self, embeddings):
+        """Compute SIGReg loss on a batch of embeddings.
 
-    # Project: (N, num_projections)
-    projections = embeddings @ directions
+        Args:
+            embeddings: (N, D) tensor of sentence embeddings
 
-    # Standardize each projection
-    mean = projections.mean(dim=0, keepdim=True)
-    std = projections.std(dim=0, keepdim=True).clamp(min=1e-8)
-    standardized = (projections - mean) / std
+        Returns:
+            loss: scalar — Epps-Pulley statistic averaged over projections
+        """
+        N, D = embeddings.shape
+        if N < 2:
+            return embeddings.new_tensor(0.0)
 
-    # Sort along sample dimension
-    sorted_vals, _ = standardized.sort(dim=0)  # (N, num_projections)
+        # Random unit projection directions
+        A = torch.randn(D, self.num_projections, device=embeddings.device)
+        A = A.div_(A.norm(p=2, dim=0))
 
-    # Expected quantiles of N(0,1) for N samples
-    # Use the inverse CDF (percent point function) at evenly spaced probabilities
-    probs = (torch.arange(N, device=device, dtype=torch.float32) + 0.5) / N
-    expected = torch.erfinv(2 * probs - 1) * math.sqrt(2)  # (N,)
-    expected = expected.unsqueeze(1)  # (N, 1)
+        # Project: (N, num_projections)
+        proj = embeddings @ A
 
-    # MSE between sorted empirical and expected quantiles
-    loss = (sorted_vals - expected).pow(2).mean()
+        # Epps-Pulley characteristic function test
+        # x_t: (N, num_projections, knots)
+        x_t = proj.unsqueeze(-1) * self.t
 
-    return loss
+        # Compare empirical characteristic function to Gaussian phi(t) = exp(-t^2/2)
+        # Real part: E[cos(x*t)] should equal phi(t)
+        # Imaginary part: E[sin(x*t)] should equal 0
+        err = (x_t.cos().mean(0) - self.phi).square() + x_t.sin().mean(0).square()
+
+        # Weighted integration over t, scaled by sample size
+        statistic = (err @ self.weights) * N
+
+        # Average over projections
+        return statistic.mean()
