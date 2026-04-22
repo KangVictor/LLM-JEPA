@@ -187,6 +187,31 @@ def main():
     print("Encoding test set...")
     test_embs = encode_texts(encoder, tokenizer, test_texts, max_length, device, args.batch_size)
 
+    # Embedding diagnostics
+    all_embs = torch.cat([train_embs, test_embs], dim=0)
+    norms = all_embs.norm(dim=1)
+    dim_var = all_embs.var(dim=0)
+    normed = F.normalize(all_embs, dim=1)
+    # sample pairwise cosine sim (cap at 2000 to avoid OOM)
+    idx = torch.randperm(len(normed))[:min(2000, len(normed))]
+    sample = normed[idx]
+    cos_sim = sample @ sample.T
+    triu_mask = torch.triu(torch.ones_like(cos_sim, dtype=torch.bool), diagonal=1)
+    pairwise_cos = cos_sim[triu_mask]
+
+    print(f"\n  Embedding diagnostics:")
+    print(f"    norm:       mean={norms.mean():.4f}  std={norms.std():.4f}")
+    print(f"    dim var:    mean={dim_var.mean():.6f}  min={dim_var.min():.6f}")
+    print(f"    cosine sim: mean={pairwise_cos.mean():.4f}  std={pairwise_cos.std():.4f}")
+    if pairwise_cos.mean() > 0.9:
+        print("    WARNING: embeddings are near-collapsed (very high cosine similarity)")
+    if dim_var.min() < 1e-6:
+        print("    WARNING: some dimensions have near-zero variance")
+
+    # L2-normalize embeddings (standard practice for linear probes)
+    train_embs = F.normalize(train_embs, dim=1)
+    test_embs = F.normalize(test_embs, dim=1)
+
     train_labels_t = torch.tensor(train_labels, dtype=torch.long)
     test_labels_t = torch.tensor(test_labels, dtype=torch.long)
 
