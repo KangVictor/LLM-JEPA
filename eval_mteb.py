@@ -102,9 +102,9 @@ def main():
     tasks = mteb.get_tasks(tasks=[args.task])
     print(f"\nRunning MTEB task: {args.task}")
 
-    results = mteb.evaluate(
+    evaluation = mteb.MTEB(tasks=tasks)
+    results = evaluation.run(
         model,
-        tasks=tasks,
         output_folder=args.output,
         encode_kwargs={"batch_size": args.batch_size},
     )
