@@ -3,3 +3,4 @@ transformers>=4.35
 datasets>=2.14
 wandb
 pyyaml
+mteb
