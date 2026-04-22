@@ -250,6 +250,7 @@ def main():
         if test_acc > best_acc:
             best_acc = test_acc
             best_epoch = epoch + 1
+            best_state = linear.state_dict()
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
             print(
@@ -258,8 +259,23 @@ def main():
                 f"test_acc={test_acc:.4f} {'*' if test_acc == best_acc else ''}"
             )
 
-    # Save results
+    # Save best model
     os.makedirs(args.output, exist_ok=True)
+    model_path = os.path.join(args.output, f"{args.task}_linear_probe.pt")
+    torch.save({
+        "linear_state_dict": best_state,
+        "hidden_size": hidden_size,
+        "num_classes": num_classes,
+        "label_names": label_names,
+        "task": args.task,
+        "best_test_accuracy": best_acc,
+        "best_epoch": best_epoch,
+        "encoder_checkpoint": args.checkpoint,
+        "config": args.config,
+    }, model_path)
+    print(f"\nSaved best model to {model_path}")
+
+    # Save results
     result = {
         "task": args.task,
         "num_classes": num_classes,
