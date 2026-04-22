@@ -16,7 +16,7 @@ import json
 import os
 
 import mteb
-from mteb.encoder_interface import Encoder
+from mteb.types import PromptType, Array
 import numpy as np
 import torch
 import yaml
@@ -25,11 +25,10 @@ from transformers import AutoTokenizer
 from src.model import SentenceEncoder
 
 
-class SentenceJEPAWrapper(Encoder):
+class SentenceJEPAWrapper:
     """Wraps the SentenceEncoder for MTEB evaluation."""
 
     def __init__(self, cfg, checkpoint_path, device="cuda", batch_size=64):
-        super().__init__()
         self.device = torch.device(device)
         self.batch_size = batch_size
         self.max_length = cfg["encoder"]["max_seq_len"]
@@ -56,16 +55,30 @@ class SentenceJEPAWrapper(Encoder):
         step = ckpt.get("step", "?")
         print(f"Loaded encoder from {checkpoint_path} (step {step})")
 
-    def encode(self, sentences, batch_size=None, **kwargs):
-        """Encode sentences for MTEB. Returns (N, H) numpy array."""
-        if batch_size is None:
-            batch_size = self.batch_size
+    def encode(
+        self,
+        inputs,
+        task_metadata=None,
+        hf_split=None,
+        hf_subset=None,
+        prompt_type: PromptType | None = None,
+        **kwargs,
+    ) -> Array:
+        """Encode sentences for MTEB.
 
+        Args:
+            inputs: DataLoader yielding batches of sentences.
+            task_metadata: The task metadata.
+            hf_split: The dataset split.
+            hf_subset: The dataset subset.
+            prompt_type: The prompt type to use.
+
+        Returns:
+            Embeddings as numpy array of shape (N, H).
+        """
         all_embeddings = []
 
-        for i in range(0, len(sentences), batch_size):
-            batch = sentences[i : i + batch_size]
-
+        for batch in inputs:
             encoded = self.tokenizer(
                 batch,
                 padding=True,
@@ -106,11 +119,7 @@ def main():
     tasks = mteb.get_tasks(tasks=[args.task])
     print(f"\nRunning MTEB task: {args.task}")
 
-    results = mteb.evaluate(
-        model,
-        tasks=tasks,
-        encode_kwargs={"batch_size": args.batch_size},
-    )
+    results = mteb.evaluate(model, tasks=tasks)
 
     # Save results
     os.makedirs(args.output, exist_ok=True)
