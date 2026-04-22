@@ -29,12 +29,15 @@ from src.model import SentenceEncoder
 class SentenceJEPAWrapper:
     """Wraps the SentenceEncoder for MTEB evaluation."""
 
-    mteb_model_meta = ModelMeta(
-        name="SentenceJEPA-Small",
-        revision="1",
-        release_date=None,
-        languages=["eng-Latn"],
-    )
+    mteb_model_meta = ModelMeta.create_empty(overwrites={
+        "name": "SentenceJEPA-Small",
+        "revision": "1",
+        "framework": ["PyTorch"],
+        "embed_dim": 256,
+        "max_tokens": 48,
+        "similarity_fn_name": "cosine",
+        "open_weights": True,
+    })
 
     def __init__(self, cfg, checkpoint_path, device="cuda", batch_size=64):
         self.device = torch.device(device)
