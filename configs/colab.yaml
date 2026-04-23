@@ -40,18 +40,18 @@ masking:
 sigreg:
   enabled: true           # ablation: true vs false
   num_projections: 1024
-  weight: 0.03
+  weight: 0.1
 
 # Training
 training:
   batch_size: 1024
-  lr: 1.0e-4
-  weight_decay: 0.01
+  lr: 1.0e-5
+  weight_decay: 1.0e-3
   warmup_steps: 1000
   epochs: 10
   precision: "bf16"
   grad_clip: 1.0
-  val_paragraphs: 1000
+  val_paragraphs: 500000
   val_every: 500
   log_every: 50
   save_every: 10000
