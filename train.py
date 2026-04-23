@@ -232,7 +232,7 @@ def main():
     print(f"Starting training for {num_epochs} epochs ({total_steps:,} steps)...")
     print(f"Steps per epoch: {steps_per_epoch:,}")
     print(f"Batch size: {batch_size}, Precision: {train_cfg['precision']}")
-    print(f"SIGReg: {cfg['sigreg']['enabled']}, Multi-mask: {cfg['masking']['multi_mask']}")
+    print(f"SIGReg: {cfg['sigreg']['enabled']}, SIGReg Lambda: {cfg['sigreg']['weight']} Multi-mask: {cfg['masking']['multi_mask']}")
     print(f"Predictor layers: {cfg['predictor']['num_layers']}")
     print(f"Mask ratio: [{cfg['masking']['mask_ratio_min']}, {cfg['masking']['mask_ratio_max']}]")
 
