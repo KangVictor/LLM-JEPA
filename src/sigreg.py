@@ -55,8 +55,8 @@ class SIGReg(nn.Module):
         # Imaginary part: E[sin(x*t)] should equal 0
         err = (x_t.cos().mean(0) - self.phi).square() + x_t.sin().mean(0).square()
 
-        # Weighted integration over t, scaled by sample size
-        statistic = (err @ self.weights) * N
+        # Weighted integration over t
+        statistic = err @ self.weights
 
         # Average over projections
         return statistic.mean()
