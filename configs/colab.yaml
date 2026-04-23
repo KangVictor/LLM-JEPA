@@ -39,13 +39,13 @@ masking:
 # SIGReg regularization
 sigreg:
   enabled: true           # ablation: true vs false
-  num_projections: 64
-  weight: 0.1
+  num_projections: 1024
+  weight: 0.03
 
 # Training
 training:
-  batch_size: 256
-  lr: 3.0e-4
+  batch_size: 1024
+  lr: 1.0e-4
   weight_decay: 0.01
   warmup_steps: 1000
   epochs: 10
