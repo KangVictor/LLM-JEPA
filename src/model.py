@@ -37,9 +37,12 @@ class ProjectionHead(nn.Module):
             return projected.reshape(*leading_shape, self.output_dim)
 
         valid = sample_mask.reshape(-1)
-        projected = flat.new_zeros(flat.size(0), self.output_dim)
         if valid.any():
-            projected[valid] = self.net(flat[valid])
+            valid_projected = self.net(flat[valid])
+            projected = valid_projected.new_zeros(flat.size(0), self.output_dim)
+            projected[valid] = valid_projected
+        else:
+            projected = flat.new_zeros(flat.size(0), self.output_dim)
         return projected.reshape(*leading_shape, self.output_dim)
 
 
@@ -199,7 +202,7 @@ class Predictor(nn.Module):
             predictions: (N_masked, D) — predicted embeddings at masked positions
         """
         predictor_input = encoder_embeddings.clone()
-        predictor_input[mask_indices] = self.mask_token
+        predictor_input[mask_indices] = self.mask_token.to(dtype=predictor_input.dtype)
 
         x = self.forward_sequence(predictor_input, sentence_mask, causal=False)
         predictions = x[mask_indices]  # (N_masked, D)
