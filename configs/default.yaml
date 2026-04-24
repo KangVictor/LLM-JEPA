@@ -4,18 +4,26 @@
 encoder:
   num_layers: 4
   hidden_size: 256
+  embedding_size: 256
   num_heads: 4
   ffn_size: 1024
+  projector_hidden_size: 2048
   max_seq_len: 48
   vocab_size: 30522  # BERT tokenizer vocab
   dropout: 0.1
 
 # Sentence-level predictor
 predictor:
-  num_layers: 2       # ablation: 1 vs 2
+  num_layers: 6       # LeWM-style stronger predictor
   hidden_size: 256
   num_heads: 4
-  ffn_size: 1024
+  ffn_size: 2048
+  projector_hidden_size: 2048
+  dropout: 0.1
+
+# JEPA objective
+objective:
+  mode: "next_sentence"  # next_sentence or masked
 
 # Data pipeline
 data:
@@ -40,14 +48,15 @@ masking:
 # SIGReg regularization
 sigreg:
   enabled: true           # ablation: true vs false
+  knots: 17
   num_projections: 1024
-  weight: 0.1
+  weight: 0.09
 
 # Training
 training:
   batch_size: 64
   lr: 3.0e-4
-  weight_decay: 0.01
+  weight_decay: 1.0e-3
   warmup_steps: 1000
   epochs: 10
   precision: "bf16"

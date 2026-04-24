@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -80,6 +81,62 @@ def save_checkpoint(model, optimizer, scheduler, step, cfg):
     print(f"Saved checkpoint: {path}")
 
 
+def compute_losses(model, batch, cfg, sigreg, amp_dtype, use_amp):
+    """Run one batch and compute prediction + SIGReg losses."""
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"]
+    sentence_mask = batch["sentence_mask"]
+    mode = cfg.get("objective", {}).get("mode", "next_sentence")
+
+    mask_counts = None
+    device_type = input_ids.device.type
+    if device_type in ("cuda", "cpu"):
+        autocast_ctx = torch.amp.autocast(
+            device_type, dtype=amp_dtype, enabled=use_amp
+        )
+    else:
+        autocast_ctx = nullcontext()
+
+    with autocast_ctx:
+        if mode == "next_sentence":
+            pred_out, targets, enc_out, pred_mask = model(
+                input_ids,
+                attention_mask,
+                sentence_mask,
+                mode="next_sentence",
+            )
+            mask_counts = pred_mask.sum(dim=1)
+        elif mode == "masked":
+            mask_indices, mask_counts = sample_masks(sentence_mask, cfg["masking"])
+            if mask_indices.sum() == 0:
+                return None
+            pred_out, targets, enc_out, _ = model(
+                input_ids,
+                attention_mask,
+                sentence_mask,
+                mask_indices=mask_indices,
+                mode="masked",
+            )
+        else:
+            raise ValueError(f"Unknown objective mode: {mode}")
+
+        if pred_out.numel() == 0:
+            return None
+
+        loss_pred = F.mse_loss(pred_out, targets)
+
+        if sigreg is not None:
+            sigreg_embs = enc_out.transpose(0, 1)  # (S, B, D)
+            sigreg_mask = sentence_mask.transpose(0, 1)  # (S, B)
+            loss_sig = sigreg(sigreg_embs, sigreg_mask)
+            loss_total = loss_pred + cfg["sigreg"]["weight"] * loss_sig
+        else:
+            loss_sig = enc_out.new_tensor(0.0)
+            loss_total = loss_pred
+
+    return loss_total, loss_pred, loss_sig, enc_out, mask_counts
+
+
 @torch.no_grad()
 def validate(model, val_loader, cfg, device, amp_dtype, use_amp, sigreg=None):
     """Run validation and return averaged losses + metrics."""
@@ -94,23 +151,21 @@ def validate(model, val_loader, cfg, device, amp_dtype, use_amp, sigreg=None):
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         sentence_mask = batch["sentence_mask"].to(device, non_blocking=True)
 
-        mask_indices, _ = sample_masks(sentence_mask, cfg["masking"])
-        if mask_indices.sum() == 0:
+        result = compute_losses(
+            model,
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "sentence_mask": sentence_mask,
+            },
+            cfg,
+            sigreg,
+            amp_dtype,
+            use_amp,
+        )
+        if result is None:
             continue
-
-        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-            pred_out, targets, enc_out = model(
-                input_ids, attention_mask, sentence_mask, mask_indices
-            )
-            loss_pred = F.mse_loss(pred_out, targets)
-
-            if sigreg is not None:
-                real_embs = enc_out[sentence_mask]
-                loss_sig = sigreg(real_embs)
-                loss_total = loss_pred + cfg["sigreg"]["weight"] * loss_sig
-            else:
-                loss_sig = torch.tensor(0.0, device=device)
-                loss_total = loss_pred
+        loss_total, loss_pred, loss_sig, enc_out, _ = result
 
         total_pred += loss_pred.item()
         total_sig += loss_sig.item()
@@ -206,7 +261,15 @@ def main():
     model = SentenceJEPA(cfg).to(device)
 
     # SIGReg module (buffers need to be on device)
-    sigreg = SIGReg(num_projections=cfg["sigreg"]["num_projections"]).to(device) if cfg["sigreg"]["enabled"] else None
+    sig_cfg = cfg["sigreg"]
+    sigreg = (
+        SIGReg(
+            knots=sig_cfg.get("knots", 17),
+            num_projections=sig_cfg["num_projections"],
+        ).to(device)
+        if sig_cfg["enabled"]
+        else None
+    )
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
@@ -232,9 +295,17 @@ def main():
     print(f"Starting training for {num_epochs} epochs ({total_steps:,} steps)...")
     print(f"Steps per epoch: {steps_per_epoch:,}")
     print(f"Batch size: {batch_size}, Precision: {train_cfg['precision']}")
-    print(f"SIGReg: {cfg['sigreg']['enabled']}, SIGReg Lambda: {cfg['sigreg']['weight']} Multi-mask: {cfg['masking']['multi_mask']}")
+    mode = cfg.get("objective", {}).get("mode", "next_sentence")
+    print(f"Objective: {mode}")
+    print(
+        f"SIGReg: {sig_cfg['enabled']}, SIGReg Lambda: {sig_cfg['weight']} "
+        f"Multi-mask: {cfg['masking']['multi_mask']}"
+    )
     print(f"Predictor layers: {cfg['predictor']['num_layers']}")
-    print(f"Mask ratio: [{cfg['masking']['mask_ratio_min']}, {cfg['masking']['mask_ratio_max']}]")
+    print(
+        f"Mask ratio: "
+        f"[{cfg['masking']['mask_ratio_min']}, {cfg['masking']['mask_ratio_max']}]"
+    )
 
     for epoch in range(num_epochs):
         print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
@@ -244,27 +315,22 @@ def main():
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             sentence_mask = batch["sentence_mask"].to(device, non_blocking=True)
 
-            # Sample masks
-            mask_indices, mask_counts = sample_masks(sentence_mask, cfg["masking"])
-
-            # Skip if no masks (shouldn't happen, but safety)
-            if mask_indices.sum() == 0:
-                continue
-
             # Forward pass
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                pred_out, targets, enc_out = model(
-                    input_ids, attention_mask, sentence_mask, mask_indices
-                )
-                loss_pred = F.mse_loss(pred_out, targets)
-
-                if sigreg is not None:
-                    real_embs = enc_out[sentence_mask]  # (N, H)
-                    loss_sig = sigreg(real_embs)
-                    loss_total = loss_pred + cfg["sigreg"]["weight"] * loss_sig
-                else:
-                    loss_sig = torch.tensor(0.0, device=device)
-                    loss_total = loss_pred
+            result = compute_losses(
+                model,
+                {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "sentence_mask": sentence_mask,
+                },
+                cfg,
+                sigreg,
+                amp_dtype,
+                use_amp,
+            )
+            if result is None:
+                continue
+            loss_total, loss_pred, loss_sig, enc_out, mask_counts = result
 
             # Backward
             optimizer.zero_grad(set_to_none=True)
