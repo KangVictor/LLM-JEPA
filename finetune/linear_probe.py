@@ -18,9 +18,9 @@ Usage:
 import argparse
 import json
 import os
+from contextlib import nullcontext
 
 import mteb
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,6 +29,19 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoTokenizer
 
 from src.model import SentenceEncoder
+
+
+def get_embedding_dim(cfg):
+    """Return the encoder output dimension used by the current projection head."""
+    enc = cfg["encoder"]
+    return enc.get("embedding_size", enc["hidden_size"])
+
+
+def autocast_context(device):
+    """Use the same bf16 inference path as eval_mteb when the backend supports it."""
+    if device.type in ("cuda", "cpu"):
+        return torch.amp.autocast(device.type, dtype=torch.bfloat16)
+    return nullcontext()
 
 
 def load_encoder(cfg, checkpoint_path, device):
@@ -56,7 +69,7 @@ def load_encoder(cfg, checkpoint_path, device):
 
 @torch.no_grad()
 def encode_texts(encoder, tokenizer, texts, max_length, device, batch_size=256):
-    """Encode a list of strings into embeddings using the frozen encoder."""
+    """Encode strings with the frozen encoder using the same shape as eval_mteb."""
     all_embeddings = []
 
     for i in range(0, len(texts), batch_size):
@@ -72,12 +85,24 @@ def encode_texts(encoder, tokenizer, texts, max_length, device, batch_size=256):
         input_ids = encoded["input_ids"].unsqueeze(1).to(device)
         attention_mask = encoded["attention_mask"].unsqueeze(1).to(device)
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            emb = encoder(input_ids, attention_mask)  # (B, 1, H)
+        with autocast_context(device):
+            emb = encoder(input_ids, attention_mask)  # (B, 1, D)
 
         all_embeddings.append(emb.squeeze(1).float().cpu())
 
     return torch.cat(all_embeddings, dim=0)
+
+
+def first_dataset_split(dataset):
+    """Unwrap common MTEB subset containers to a split dictionary."""
+    if "train" in dataset or "training" in dataset:
+        return dataset
+
+    for subset in dataset.values():
+        if "train" in subset or "training" in subset:
+            return subset
+
+    raise ValueError(f"No train split found. Available: {list(dataset.keys())}")
 
 
 def load_mteb_classification_data(task_name):
@@ -91,6 +116,7 @@ def load_mteb_classification_data(task_name):
     task.load_data()
 
     ds = task.dataset
+    ds = first_dataset_split(ds)
 
     # Find available splits
     if "train" in ds:
@@ -114,16 +140,24 @@ def load_mteb_classification_data(task_name):
     # Some datasets use different column names
     train_cols = train_split.column_names
     if "text" not in train_cols:
-        for candidate in ["sentence", "sentence1", "query", "question"]:
+        for candidate in ["sentence", "sentence1", "query", "question", "content"]:
             if candidate in train_cols:
                 text_col = candidate
                 break
+        else:
+            raise ValueError(
+                f"No supported text column found. Available columns: {train_cols}"
+            )
 
     if "label" not in train_cols:
         for candidate in ["label_text", "labels", "class"]:
             if candidate in train_cols:
                 label_col = candidate
                 break
+        else:
+            raise ValueError(
+                f"No supported label column found. Available columns: {train_cols}"
+            )
 
     train_texts = train_split[text_col]
     train_labels_raw = train_split[label_col]
@@ -169,7 +203,7 @@ def main():
     encoder = load_encoder(cfg, args.checkpoint, device)
     tokenizer = AutoTokenizer.from_pretrained(cfg["data"]["tokenizer"], use_fast=True)
     max_length = cfg["encoder"]["max_seq_len"]
-    hidden_size = cfg["encoder"]["hidden_size"]
+    embedding_dim = get_embedding_dim(cfg)
 
     # Load dataset
     print(f"\nLoading MTEB task: {args.task}")
@@ -186,6 +220,13 @@ def main():
     train_embs = encode_texts(encoder, tokenizer, train_texts, max_length, device, args.batch_size)
     print("Encoding test set...")
     test_embs = encode_texts(encoder, tokenizer, test_texts, max_length, device, args.batch_size)
+
+    if train_embs.size(1) != embedding_dim:
+        print(
+            f"  NOTE: config embedding_dim={embedding_dim}, "
+            f"but encoder returned {train_embs.size(1)}; using returned size."
+        )
+        embedding_dim = train_embs.size(1)
 
     # Embedding diagnostics
     all_embs = torch.cat([train_embs, test_embs], dim=0)
@@ -222,7 +263,7 @@ def main():
     test_loader = DataLoader(test_ds, batch_size=args.batch_size)
 
     # Linear probe
-    linear = nn.Linear(hidden_size, num_classes).to(device)
+    linear = nn.Linear(embedding_dim, num_classes).to(device)
     optimizer = torch.optim.AdamW(
         linear.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -289,7 +330,7 @@ def main():
     model_path = os.path.join(args.output, f"{args.task}_linear_probe.pt")
     torch.save({
         "linear_state_dict": best_state,
-        "hidden_size": hidden_size,
+        "embedding_dim": embedding_dim,
         "num_classes": num_classes,
         "label_names": label_names,
         "task": args.task,
@@ -313,7 +354,7 @@ def main():
         "batch_size": args.batch_size,
         "weight_decay": args.weight_decay,
         "checkpoint": args.checkpoint,
-        "hidden_size": hidden_size,
+        "embedding_dim": embedding_dim,
     }
 
     output_path = os.path.join(args.output, f"{args.task}_linear_probe.json")
