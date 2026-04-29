@@ -25,12 +25,14 @@ Excluded source:
 """
 
 import argparse
+import json
 import os
 import random
 import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 
 torch = None
 load_dataset = None
@@ -393,6 +395,269 @@ def collect_source_samples(
     }
 
 
+def source_shard_dir(output, source_name):
+    return Path(output) / "shards" / source_name
+
+
+def shard_files(output, source_name=None):
+    root = Path(output) / "shards"
+    if source_name is not None:
+        root = root / source_name
+    if not root.exists():
+        return []
+    return sorted(root.rglob("shard_*.pt"))
+
+
+def read_shard(path):
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(payload, list):
+        return payload, {"path": str(path), "num_samples": len(payload)}
+    return payload["samples"], payload.get("meta", {})
+
+
+def count_existing_samples(output, source_name):
+    total = 0
+    paths = shard_files(output, source_name)
+    for path in paths:
+        samples, _ = read_shard(path)
+        total += len(samples)
+    return total, paths
+
+
+def save_shard(output, source_name, shard_index, samples, meta):
+    out_dir = source_shard_dir(output, source_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"shard_{shard_index:06d}.pt"
+    tmp_path = out_dir / f"shard_{shard_index:06d}.tmp"
+    torch.save({"samples": samples, "meta": meta}, tmp_path)
+    os.replace(tmp_path, path)
+    return path
+
+
+def write_json(path, payload):
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def generate_source_shards(
+    source_name,
+    quota,
+    cfg,
+    tokenizer,
+    output,
+    tokenizer_batch_paragraphs,
+    min_chars,
+    shard_size,
+    resume,
+):
+    data_cfg = cfg["data"]
+    min_sentences = data_cfg["min_sentences"]
+    max_sentences = data_cfg["max_sentences"]
+    max_tokens = data_cfg["max_tokens_per_sentence"]
+
+    existing_count, existing_paths = count_existing_samples(output, source_name)
+    if existing_count > quota:
+        print(
+            f"  {source_name}: found {existing_count:,} existing samples, "
+            f"which already exceeds quota {quota:,}."
+        )
+        return {
+            "requested": quota,
+            "existing": existing_count,
+            "collected": 0,
+            "total": existing_count,
+            "shards": [str(path) for path in existing_paths],
+        }
+    if existing_count and not resume:
+        raise FileExistsError(
+            f"Found {existing_count:,} existing {source_name} shard samples in "
+            f"{source_shard_dir(output, source_name)}. Use --resume or choose a new output."
+        )
+
+    print(
+        f"  {source_name}: existing={existing_count:,}, "
+        f"remaining={quota - existing_count:,}"
+    )
+
+    iterator = iter_source_paragraphs(
+        source_name, min_sentences, max_sentences, min_chars
+    )
+    skipped = 0
+    paragraph_batch = []
+    shard_samples = []
+    sentence_counts = []
+    collected = 0
+    scanned = 0
+    t0 = time.time()
+    shard_index = len(existing_paths)
+
+    def flush_token_batch():
+        nonlocal paragraph_batch, shard_samples, collected
+        if not paragraph_batch:
+            return
+        new_samples = tokenize_paragraph_batch(tokenizer, paragraph_batch, max_tokens)
+        paragraph_batch = []
+        for sample in new_samples:
+            if existing_count + collected >= quota:
+                break
+            sample["source"] = source_name
+            shard_samples.append(sample)
+            sentence_counts.append(sample["num_sentences"])
+            collected += 1
+
+    def flush_shard(force=False):
+        nonlocal shard_samples, shard_index
+        if not shard_samples:
+            return None
+        if not force and len(shard_samples) < shard_size:
+            return None
+        path = save_shard(
+            output,
+            source_name,
+            shard_index,
+            shard_samples,
+            {
+                "source": source_name,
+                "shard_index": shard_index,
+                "num_samples": len(shard_samples),
+                "created_at": time.time(),
+                "min_sentences": min_sentences,
+                "max_sentences": max_sentences,
+                "max_tokens_per_sentence": max_tokens,
+            },
+        )
+        print(f"  saved {path} ({len(shard_samples):,} samples)")
+        shard_index += 1
+        shard_samples = []
+        return path
+
+    for sentences in iterator:
+        scanned += 1
+        if skipped < existing_count:
+            skipped += 1
+            continue
+
+        paragraph_batch.append(sentences)
+        if len(paragraph_batch) >= tokenizer_batch_paragraphs:
+            flush_token_batch()
+            flush_shard()
+
+            elapsed = max(time.time() - t0, 1e-6)
+            total_now = existing_count + collected
+            print(
+                f"  {source_name}: {total_now:,}/{quota:,} samples "
+                f"({collected / elapsed:.1f} new samples/s)"
+            )
+            if total_now >= quota:
+                break
+
+    if existing_count + collected < quota:
+        flush_token_batch()
+    flush_shard(force=True)
+
+    total = existing_count + collected
+    if total < quota:
+        raise RuntimeError(
+            f"Source '{source_name}' ended at {total:,} samples, "
+            f"but quota was {quota:,}."
+        )
+
+    meta = {
+        "source": source_name,
+        "requested": quota,
+        "existing": existing_count,
+        "collected": collected,
+        "total": total,
+        "skipped_for_resume": skipped,
+        "scanned_usable_paragraphs": scanned,
+        "sentence_count_mean": (
+            sum(sentence_counts) / len(sentence_counts) if sentence_counts else None
+        ),
+        "shard_size": shard_size,
+    }
+    write_json(source_shard_dir(output, source_name) / "source_meta.json", meta)
+    return meta
+
+
+def load_samples_from_shards(output, quotas=None):
+    samples_by_source = defaultdict(list)
+    all_paths = shard_files(output)
+    if not all_paths:
+        raise FileNotFoundError(f"No shard_*.pt files found under {Path(output) / 'shards'}")
+
+    for path in all_paths:
+        samples, _ = read_shard(path)
+        for sample in samples:
+            source = sample.get("source", path.parent.name)
+            if quotas is not None and source not in quotas:
+                continue
+            if quotas is not None and source in quotas:
+                if len(samples_by_source[source]) >= quotas[source]:
+                    continue
+            samples_by_source[source].append(sample)
+
+    if quotas is not None:
+        missing = {
+            source: quotas[source] - len(samples_by_source[source])
+            for source in quotas
+            if len(samples_by_source[source]) < quotas[source]
+        }
+        if missing:
+            raise RuntimeError(f"Not enough shard samples for requested mix: {missing}")
+
+    all_samples = []
+    for source, samples in samples_by_source.items():
+        if quotas is not None and source in quotas:
+            samples = samples[: quotas[source]]
+        all_samples.extend(samples)
+    return all_samples
+
+
+def save_final_dataset(samples, output, val_size, seed, meta_extra=None):
+    random.seed(seed)
+    random.shuffle(samples)
+
+    val_samples = samples[:val_size]
+    train_samples = samples[val_size:]
+
+    sentence_counts = torch.tensor(
+        [sample["num_sentences"] for sample in samples], dtype=torch.float32
+    )
+    source_counts = defaultdict(int)
+    for sample in samples:
+        source_counts[sample.get("source", "unknown")] += 1
+
+    meta = {
+        "num_paragraphs": len(samples),
+        "num_train": len(train_samples),
+        "num_val": len(val_samples),
+        "source_counts": dict(source_counts),
+        "sentence_count_mean": sentence_counts.mean().item(),
+        "sentence_count_min": sentence_counts.min().item(),
+        "sentence_count_max": sentence_counts.max().item(),
+    }
+    if meta_extra:
+        meta.update(meta_extra)
+
+    os.makedirs(output, exist_ok=True)
+    train_path = os.path.join(output, "train.pt")
+    val_path = os.path.join(output, "val.pt")
+    meta_path = os.path.join(output, "meta.pt")
+
+    print("\nSaving final dataset...")
+    torch.save(train_samples, train_path)
+    torch.save(val_samples, val_path)
+    torch.save(meta, meta_path)
+
+    print(f"  train.pt: {len(train_samples):,} paragraphs")
+    print(f"  val.pt:   {len(val_samples):,} paragraphs")
+    print(f"  meta.pt:  dataset statistics")
+    print("  source counts:")
+    for name, count in sorted(source_counts.items()):
+        print(f"    {name}: {count:,}")
+    return train_path, val_path, meta_path
+
+
 def list_sources():
     print("Available dataset sources:")
     for name, spec in SOURCE_SPECS.items():
@@ -410,6 +675,22 @@ def main():
     parser.add_argument("--output", type=str, required=False)
     parser.add_argument("--total_paragraphs", type=int, required=False)
     parser.add_argument(
+        "--mode",
+        choices=("full", "generate_shards", "combine_shards"),
+        default="full",
+        help=(
+            "full writes train.pt/val.pt directly; generate_shards writes "
+            "resumable source shards; combine_shards builds train.pt/val.pt "
+            "from saved shards."
+        ),
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help="With --mode generate_shards, process only one source.",
+    )
+    parser.add_argument(
         "--mix",
         type=str,
         default="wikipedia=0.5,openwebtext=0.3,bookcorpus=0.2",
@@ -421,7 +702,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val_paragraphs", type=int, default=None)
     parser.add_argument("--tokenizer_batch_paragraphs", type=int, default=4096)
+    parser.add_argument("--shard_size", type=int, default=100000)
     parser.add_argument("--min_chars", type=int, default=20)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--list_sources", action="store_true")
     args = parser.parse_args()
@@ -432,9 +715,16 @@ def main():
 
     if args.output is None:
         raise ValueError("--output is required unless --list_sources is used")
-    if args.total_paragraphs is None or args.total_paragraphs <= 0:
+    if args.mode != "combine_shards" and (
+        args.total_paragraphs is None or args.total_paragraphs <= 0
+    ):
         raise ValueError("--total_paragraphs must be a positive integer")
-    if os.path.exists(args.output) and os.listdir(args.output) and not args.overwrite:
+    if (
+        args.mode == "full"
+        and os.path.exists(args.output)
+        and os.listdir(args.output)
+        and not args.overwrite
+    ):
         raise FileExistsError(
             f"Output directory already exists and is not empty: {args.output}. "
             "Use --overwrite to replace train.pt/val.pt/meta.pt."
@@ -453,13 +743,69 @@ def main():
         if args.val_paragraphs is not None
         else cfg["training"].get("val_paragraphs", 1000)
     )
-    if val_size >= args.total_paragraphs:
+    if args.total_paragraphs is not None and val_size >= args.total_paragraphs:
         raise ValueError(
             f"val_paragraphs={val_size} must be smaller than "
             f"total_paragraphs={args.total_paragraphs}"
         )
 
-    quotas = compute_quotas(proportions, args.total_paragraphs)
+    quotas = (
+        compute_quotas(proportions, args.total_paragraphs)
+        if args.total_paragraphs is not None
+        else None
+    )
+
+    if args.source is not None:
+        args.source = args.source.lower()
+        if args.source not in SOURCE_SPECS:
+            choices = ", ".join(sorted(SOURCE_SPECS))
+            raise ValueError(f"Unknown source '{args.source}'. Available: {choices}")
+        if not SOURCE_SPECS[args.source].supported:
+            raise ValueError(
+                f"Source '{args.source}' is excluded: {SOURCE_SPECS[args.source].reason}"
+            )
+        if args.mode != "generate_shards":
+            raise ValueError("--source is only valid with --mode generate_shards")
+        if args.source not in quotas:
+            raise ValueError(
+                f"--source {args.source} is not present in --mix {args.mix}. "
+                f"Use --mix {args.source}=1 to generate only that source."
+            )
+
+    if args.mode == "combine_shards":
+        print("Combining existing shards...")
+        if quotas is None:
+            print("  Using all available shard samples.")
+        else:
+            print("  Requested mix quotas:")
+            for name, quota in quotas.items():
+                print(f"    {name}: {quota:,}")
+        all_samples = load_samples_from_shards(args.output, quotas)
+        if val_size >= len(all_samples):
+            raise ValueError(
+                f"val_paragraphs={val_size} must be smaller than available "
+                f"sample count {len(all_samples):,}"
+            )
+        save_final_dataset(
+            all_samples,
+            args.output,
+            val_size,
+            args.seed,
+            {
+                "mix": proportions if quotas is not None else None,
+                "quotas": quotas,
+                "excluded_sources": {
+                    name: spec.reason
+                    for name, spec in SOURCE_SPECS.items()
+                    if not spec.supported
+                },
+                "tokenizer": cfg["data"]["tokenizer"],
+                "max_tokens_per_sentence": cfg["data"]["max_tokens_per_sentence"],
+                "min_sentences": cfg["data"]["min_sentences"],
+                "max_sentences": cfg["data"]["max_sentences"],
+            },
+        )
+        return
 
     print("Dataset generation plan:")
     print(f"  total_paragraphs: {args.total_paragraphs:,}")
@@ -478,6 +824,48 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         cfg["data"]["tokenizer"], use_fast=True
     )
+
+    if args.mode == "generate_shards":
+        selected_sources = [args.source] if args.source else list(quotas)
+        print("\nGenerating resumable shards only.")
+        print(f"  shard_size: {args.shard_size:,}")
+        print(f"  resume:     {args.resume}")
+        shard_meta = {}
+        for name in selected_sources:
+            print(f"\nCollecting {name} shards...")
+            shard_meta[name] = generate_source_shards(
+                source_name=name,
+                quota=quotas[name],
+                cfg=cfg,
+                tokenizer=tokenizer,
+                output=args.output,
+                tokenizer_batch_paragraphs=args.tokenizer_batch_paragraphs,
+                min_chars=args.min_chars,
+                shard_size=args.shard_size,
+                resume=args.resume,
+            )
+
+        os.makedirs(args.output, exist_ok=True)
+        write_json(
+            Path(args.output) / "shard_plan.json",
+            {
+                "mode": "generate_shards",
+                "mix": proportions,
+                "quotas": quotas,
+                "selected_sources": selected_sources,
+                "shard_size": args.shard_size,
+                "meta": shard_meta,
+            },
+        )
+        print("\nShard generation complete.")
+        print("To combine later:")
+        print(
+            "  python generate_dataset.py --mode combine_shards "
+            f"--config {args.config} --output {args.output} "
+            f"--total_paragraphs {args.total_paragraphs} --mix {args.mix} "
+            f"--val_paragraphs {val_size}"
+        )
+        return
 
     all_samples = []
     source_meta = {}
@@ -500,63 +888,32 @@ def main():
             k: v for k, v in stats.items() if k != "sentence_counts"
         }
 
-    random.seed(args.seed)
-    random.shuffle(all_samples)
-
-    val_samples = all_samples[:val_size]
-    train_samples = all_samples[val_size:]
-
-    sentence_counts = torch.tensor(
-        [sample["num_sentences"] for sample in all_samples], dtype=torch.float32
-    )
-
-    source_counts = defaultdict(int)
-    for sample in all_samples:
-        source_counts[sample["source"]] += 1
-
-    meta = {
-        "num_paragraphs": len(all_samples),
-        "num_train": len(train_samples),
-        "num_val": len(val_samples),
-        "source_counts": dict(source_counts),
-        "source_meta": source_meta,
-        "mix": proportions,
-        "quotas": quotas,
-        "excluded_sources": {
-            name: spec.reason
-            for name, spec in SOURCE_SPECS.items()
-            if not spec.supported
+    save_final_dataset(
+        all_samples,
+        args.output,
+        val_size,
+        args.seed,
+        {
+            "source_meta": source_meta,
+            "mix": proportions,
+            "quotas": quotas,
+            "excluded_sources": {
+                name: spec.reason
+                for name, spec in SOURCE_SPECS.items()
+                if not spec.supported
+            },
+            "tokenizer": cfg["data"]["tokenizer"],
+            "max_tokens_per_sentence": cfg["data"]["max_tokens_per_sentence"],
+            "min_sentences": cfg["data"]["min_sentences"],
+            "max_sentences": cfg["data"]["max_sentences"],
         },
-        "sentence_count_mean": sentence_counts.mean().item(),
-        "sentence_count_min": sentence_counts.min().item(),
-        "sentence_count_max": sentence_counts.max().item(),
-        "tokenizer": cfg["data"]["tokenizer"],
-        "max_tokens_per_sentence": cfg["data"]["max_tokens_per_sentence"],
-        "min_sentences": cfg["data"]["min_sentences"],
-        "max_sentences": cfg["data"]["max_sentences"],
-    }
-
-    os.makedirs(args.output, exist_ok=True)
-    train_path = os.path.join(args.output, "train.pt")
-    val_path = os.path.join(args.output, "val.pt")
-    meta_path = os.path.join(args.output, "meta.pt")
-
-    print("\nSaving...")
-    torch.save(train_samples, train_path)
-    torch.save(val_samples, val_path)
-    torch.save(meta, meta_path)
+    )
 
     elapsed = time.time() - t0
     print(f"\n{'=' * 60}")
     print(f"Saved mixed dataset to {args.output}/")
     print(f"{'=' * 60}")
-    print(f"  train.pt: {len(train_samples):,} paragraphs")
-    print(f"  val.pt:   {len(val_samples):,} paragraphs")
-    print(f"  meta.pt:  dataset statistics")
     print(f"  elapsed:  {elapsed:.0f}s")
-    print("  source counts:")
-    for name, count in sorted(source_counts.items()):
-        print(f"    {name}: {count:,}")
     print("\nTo train:")
     print(
         "  python train.py --config "
