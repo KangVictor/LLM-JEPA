@@ -579,22 +579,61 @@ def generate_source_shards(
     return meta
 
 
-def load_samples_from_shards(output, quotas=None):
+def load_samples_from_shards(output, quotas=None, log_every=10):
     samples_by_source = defaultdict(list)
     all_paths = shard_files(output)
     if not all_paths:
         raise FileNotFoundError(f"No shard_*.pt files found under {Path(output) / 'shards'}")
 
+    print(f"  Found {len(all_paths):,} shard files under {Path(output) / 'shards'}")
+    by_source = defaultdict(int)
     for path in all_paths:
+        by_source[path.parent.name] += 1
+    for source, count in sorted(by_source.items()):
+        target = quotas.get(source) if quotas is not None else None
+        target_text = f", quota={target:,}" if target is not None else ""
+        print(f"    {source}: {count:,} shards{target_text}")
+
+    t0 = time.time()
+    for index, path in enumerate(all_paths, start=1):
         samples, _ = read_shard(path)
+        kept = 0
+        skipped = 0
         for sample in samples:
             source = sample.get("source", path.parent.name)
             if quotas is not None and source not in quotas:
+                skipped += 1
                 continue
             if quotas is not None and source in quotas:
                 if len(samples_by_source[source]) >= quotas[source]:
+                    skipped += 1
                     continue
             samples_by_source[source].append(sample)
+            kept += 1
+
+        if index == 1 or index == len(all_paths) or index % log_every == 0:
+            elapsed = max(time.time() - t0, 1e-6)
+            loaded = sum(len(items) for items in samples_by_source.values())
+            print(
+                f"  loaded shard {index:,}/{len(all_paths):,}: {path.name} "
+                f"kept={kept:,} skipped={skipped:,} total_loaded={loaded:,} "
+                f"({loaded / elapsed:.1f} samples/s)"
+            )
+            for source in sorted(samples_by_source):
+                if quotas is not None and source in quotas:
+                    print(
+                        f"    {source}: {len(samples_by_source[source]):,}/"
+                        f"{quotas[source]:,}"
+                    )
+                else:
+                    print(f"    {source}: {len(samples_by_source[source]):,}")
+
+        if quotas is not None and all(
+            len(samples_by_source[source]) >= quotas[source]
+            for source in quotas
+        ):
+            print("  Reached all requested source quotas; stopping shard load.")
+            break
 
     if quotas is not None:
         missing = {
@@ -610,16 +649,20 @@ def load_samples_from_shards(output, quotas=None):
         if quotas is not None and source in quotas:
             samples = samples[: quotas[source]]
         all_samples.extend(samples)
+    print(f"  Total loaded samples for combine: {len(all_samples):,}")
     return all_samples
 
 
 def save_final_dataset(samples, output, val_size, seed, meta_extra=None):
+    print(f"  Shuffling {len(samples):,} samples with seed={seed}...")
     random.seed(seed)
     random.shuffle(samples)
 
+    print(f"  Splitting val={val_size:,}, train={len(samples) - val_size:,}...")
     val_samples = samples[:val_size]
     train_samples = samples[val_size:]
 
+    print("  Computing final metadata...")
     sentence_counts = torch.tensor(
         [sample["num_sentences"] for sample in samples], dtype=torch.float32
     )
@@ -645,8 +688,11 @@ def save_final_dataset(samples, output, val_size, seed, meta_extra=None):
     meta_path = os.path.join(output, "meta.pt")
 
     print("\nSaving final dataset...")
+    print(f"  writing {train_path} ...")
     torch.save(train_samples, train_path)
+    print(f"  writing {val_path} ...")
     torch.save(val_samples, val_path)
+    print(f"  writing {meta_path} ...")
     torch.save(meta, meta_path)
 
     print(f"  train.pt: {len(train_samples):,} paragraphs")
@@ -703,6 +749,12 @@ def main():
     parser.add_argument("--val_paragraphs", type=int, default=None)
     parser.add_argument("--tokenizer_batch_paragraphs", type=int, default=4096)
     parser.add_argument("--shard_size", type=int, default=100000)
+    parser.add_argument(
+        "--combine_log_every",
+        type=int,
+        default=10,
+        help="Print combine progress every N shard files.",
+    )
     parser.add_argument("--min_chars", type=int, default=20)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -780,7 +832,11 @@ def main():
             print("  Requested mix quotas:")
             for name, quota in quotas.items():
                 print(f"    {name}: {quota:,}")
-        all_samples = load_samples_from_shards(args.output, quotas)
+        all_samples = load_samples_from_shards(
+            args.output,
+            quotas,
+            log_every=max(1, args.combine_log_every),
+        )
         if val_size >= len(all_samples):
             raise ValueError(
                 f"val_paragraphs={val_size} must be smaller than available "
