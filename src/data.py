@@ -193,6 +193,26 @@ class PreprocessedDataset(Dataset):
         return self.samples[idx]
 
 
+def format_meta_value(value):
+    """Format preprocessed metadata without assuming every value is scalar."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        return f"{value:.4g}"
+    if isinstance(value, dict):
+        items = list(value.items())
+        preview = ", ".join(
+            f"{k}: {format_meta_value(v)}" for k, v in items[:5]
+        )
+        suffix = ", ..." if len(items) > 5 else ""
+        return "{" + preview + suffix + "}"
+    if isinstance(value, (list, tuple)):
+        return f"{type(value).__name__}(len={len(value):,})"
+    return str(value)
+
+
 def load_preprocessed(cfg):
     """Load pre-processed train/val splits and metadata.
 
@@ -215,10 +235,7 @@ def load_preprocessed(cfg):
     print(f"Preprocessed Dataset Summary")
     print(f"{'='*50}")
     for k, v in meta.items():
-        if isinstance(v, float):
-            print(f"  {k}: {v:.1f}")
-        else:
-            print(f"  {k}: {v:,}")
+        print(f"  {k}: {format_meta_value(v)}")
     print(f"  Steps/epoch (bs={batch_size}): {steps_per_epoch:,}")
     print(f"{'='*50}\n")
 
