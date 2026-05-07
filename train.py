@@ -64,21 +64,68 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def save_checkpoint(model, optimizer, scheduler, step, cfg):
+def save_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    step,
+    cfg,
+    steps_per_epoch=None,
+    total_steps=None,
+):
     ckpt_dir = cfg["training"]["checkpoint_dir"]
     os.makedirs(ckpt_dir, exist_ok=True)
     path = os.path.join(ckpt_dir, f"step_{step}.pt")
-    torch.save(
-        {
-            "step": step,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "config": cfg,
-        },
-        path,
-    )
+    checkpoint = {
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "config": cfg,
+    }
+    if steps_per_epoch is not None:
+        checkpoint["steps_per_epoch"] = steps_per_epoch
+    if total_steps is not None:
+        checkpoint["total_steps"] = total_steps
+    torch.save(checkpoint, path)
     print(f"Saved checkpoint: {path}")
+
+
+def load_checkpoint(path, model, optimizer, scheduler, device):
+    """Restore training state and return the global completed step."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    if "optimizer_state_dict" not in checkpoint:
+        raise KeyError(
+            "Checkpoint does not contain optimizer_state_dict; cannot resume "
+            "with the exact optimizer/LR state."
+        )
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    ckpt_step = int(checkpoint.get("step", 0))
+    scheduler_state = checkpoint.get("scheduler_state_dict")
+    if scheduler_state is None:
+        raise KeyError(
+            "Checkpoint does not contain scheduler_state_dict; cannot resume "
+            "with a learning rate consistent with the previous step."
+        )
+
+    scheduler.load_state_dict(scheduler_state)
+    scheduler_step = int(scheduler_state.get("last_epoch", ckpt_step))
+    resume_step = scheduler_step
+    current_lr = optimizer.param_groups[0]["lr"]
+
+    print(f"Loaded checkpoint: {path}")
+    print(
+        f"Resuming from global step {resume_step:,} "
+        f"(checkpoint step={ckpt_step:,}, scheduler step={scheduler_step:,}, "
+        f"lr={current_lr:.6g})"
+    )
+    return resume_step
 
 
 def compute_losses(model, batch, cfg, sigreg, amp_dtype, use_amp):
@@ -200,6 +247,14 @@ def main():
     parser.add_argument(
         "--override", nargs="*", help="Config overrides: key.subkey=value"
     )
+    parser.add_argument(
+        "--resume_from",
+        "--resume-from",
+        dest="resume_from",
+        type=str,
+        default=None,
+        help="Path to a training checkpoint to resume from.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args)
@@ -284,16 +339,30 @@ def main():
         optimizer, train_cfg["warmup_steps"], total_steps
     )
 
+    resume_from = args.resume_from or train_cfg.get("resume_from")
+    step = 0
+    if resume_from:
+        step = load_checkpoint(resume_from, model, optimizer, scheduler, device)
+        if step >= total_steps:
+            raise ValueError(
+                f"Checkpoint is already at step {step:,}, but this run is "
+                f"configured for only {total_steps:,} total steps. Increase "
+                "training.epochs if you want to continue training longer."
+            )
+
     # Mixed precision
     use_amp = train_cfg["precision"] in ("bf16", "fp16")
     amp_dtype = torch.bfloat16 if train_cfg["precision"] == "bf16" else torch.float16
 
     # Training loop
     model.train()
-    step = 0
+    start_step = step
+    start_epoch = step // steps_per_epoch if steps_per_epoch > 0 else 0
 
     print(f"Starting training for {num_epochs} epochs ({total_steps:,} steps)...")
     print(f"Steps per epoch: {steps_per_epoch:,}")
+    if resume_from:
+        print(f"Remaining steps: {total_steps - step:,}")
     print(f"Batch size: {batch_size}, Precision: {train_cfg['precision']}")
     mode = cfg.get("objective", {}).get("mode", "next_sentence")
     print(f"Objective: {mode}")
@@ -307,10 +376,14 @@ def main():
         f"[{cfg['masking']['mask_ratio_min']}, {cfg['masking']['mask_ratio_max']}]"
     )
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
+        epoch_end_step = min((epoch + 1) * steps_per_epoch, total_steps)
 
         for batch in loader:
+            if step >= epoch_end_step:
+                break
+
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             sentence_mask = batch["sentence_mask"].to(device, non_blocking=True)
@@ -338,6 +411,7 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["grad_clip"])
             optimizer.step()
             scheduler.step()
+            step = int(scheduler.last_epoch)
 
             # Logging
             if step % train_cfg["log_every"] == 0:
@@ -360,17 +434,36 @@ def main():
 
             # Checkpointing
             if step > 0 and step % train_cfg["save_every"] == 0:
-                save_checkpoint(model, optimizer, scheduler, step, cfg)
-
-            step += 1
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    step,
+                    cfg,
+                    steps_per_epoch=steps_per_epoch,
+                    total_steps=total_steps,
+                )
 
         # End-of-epoch validation + checkpoint
+        if step == start_step:
+            continue
         val_result = validate(model, val_loader, cfg, device, amp_dtype, use_amp, sigreg)
         if val_result is not None:
             val_losses, val_metrics = val_result
             log_val(step, val_losses, val_metrics, wandb_run)
-        save_checkpoint(model, optimizer, scheduler, step, cfg)
+        save_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            step,
+            cfg,
+            steps_per_epoch=steps_per_epoch,
+            total_steps=total_steps,
+        )
         print(f"Epoch {epoch + 1} complete at step {step}")
+
+        if step >= total_steps:
+            break
 
     print(f"\nTraining complete: {num_epochs} epochs, {step} steps")
 

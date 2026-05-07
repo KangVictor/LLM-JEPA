@@ -65,6 +65,7 @@ training:
   log_every: 50
   save_every: 10000
   checkpoint_dir: "/content/drive/MyDrive/SentenceJEPAModel"
+  resume_from: null
   seed: 42
 
 # Weights & Biases
