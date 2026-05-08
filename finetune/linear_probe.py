@@ -13,6 +13,13 @@ Usage:
         --checkpoint checkpoints/step_50000.pt \
         --task AmazonPolarityClassification \
         --epochs 10 --lr 1e-3 --batch_size 256
+
+    python -m finetune.linear_probe \
+        --config configs/default.yaml \
+        --checkpoint checkpoints/step_50000.pt \
+        --task AmazonPolarityClassification \
+        --embedding_mode sentence_mean \
+        --encode_batch_size 64
 """
 
 import argparse
@@ -28,6 +35,7 @@ import yaml
 from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoTokenizer
 
+from src.data import split_sentences
 from src.model import SentenceEncoder
 
 
@@ -68,8 +76,8 @@ def load_encoder(cfg, checkpoint_path, device):
 
 
 @torch.no_grad()
-def encode_texts(encoder, tokenizer, texts, max_length, device, batch_size=256):
-    """Encode strings with the frozen encoder using the same shape as eval_mteb."""
+def encode_texts_single(encoder, tokenizer, texts, max_length, device, batch_size=256):
+    """Encode each text as one truncated sequence: (B, T) -> (B, 1, T)."""
     all_embeddings = []
 
     for i in range(0, len(texts), batch_size):
@@ -91,6 +99,110 @@ def encode_texts(encoder, tokenizer, texts, max_length, device, batch_size=256):
         all_embeddings.append(emb.squeeze(1).float().cpu())
 
     return torch.cat(all_embeddings, dim=0)
+
+
+def text_to_sentences(text, max_sentences=None):
+    """Split one example into sentences, falling back to the raw text."""
+    text = "" if text is None else str(text).strip()
+    sentences = split_sentences(text)
+    if not sentences:
+        sentences = [text]
+    if max_sentences is not None:
+        sentences = sentences[:max_sentences]
+    return sentences or [text]
+
+
+@torch.no_grad()
+def encode_texts_sentence_mean(
+    encoder,
+    tokenizer,
+    texts,
+    max_length,
+    device,
+    batch_size=64,
+    max_sentences=None,
+):
+    """Encode split sentences and mean-pool sentence embeddings per example."""
+    all_embeddings = []
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        sentence_lists = [
+            text_to_sentences(text, max_sentences=max_sentences)
+            for text in batch
+        ]
+        flat_sentences = [
+            sentence
+            for sentences in sentence_lists
+            for sentence in sentences
+        ]
+
+        encoded = tokenizer(
+            flat_sentences,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+
+        B = len(sentence_lists)
+        S = max(len(sentences) for sentences in sentence_lists)
+        T = encoded["input_ids"].size(1)
+
+        input_ids = torch.zeros(B, S, T, dtype=torch.long)
+        attention_mask = torch.zeros(B, S, T, dtype=torch.long)
+        sentence_mask = torch.zeros(B, S, dtype=torch.bool)
+
+        offset = 0
+        for row, sentences in enumerate(sentence_lists):
+            count = len(sentences)
+            input_ids[row, :count] = encoded["input_ids"][offset : offset + count]
+            attention_mask[row, :count] = encoded["attention_mask"][
+                offset : offset + count
+            ]
+            sentence_mask[row, :count] = True
+            offset += count
+
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        sentence_mask = sentence_mask.to(device)
+
+        with autocast_context(device):
+            sent_embs = encoder(input_ids, attention_mask)  # (B, S, D)
+            weights = sentence_mask.unsqueeze(-1).to(dtype=sent_embs.dtype)
+            emb = (sent_embs * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
+
+        all_embeddings.append(emb.float().cpu())
+
+    return torch.cat(all_embeddings, dim=0)
+
+
+def encode_texts(
+    encoder,
+    tokenizer,
+    texts,
+    max_length,
+    device,
+    batch_size=256,
+    embedding_mode="single",
+    max_sentences=None,
+):
+    """Encode strings with either single-sequence or sentence-mean pooling."""
+    if embedding_mode == "single":
+        return encode_texts_single(
+            encoder, tokenizer, texts, max_length, device, batch_size
+        )
+    if embedding_mode == "sentence_mean":
+        return encode_texts_sentence_mean(
+            encoder,
+            tokenizer,
+            texts,
+            max_length,
+            device,
+            batch_size,
+            max_sentences=max_sentences,
+        )
+    raise ValueError(f"Unknown embedding mode: {embedding_mode}")
 
 
 def first_dataset_split(dataset):
@@ -191,6 +303,27 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output", type=str, default="results/finetune")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--embedding_mode",
+        choices=["single", "sentence_mean"],
+        default="single",
+        help=(
+            "single: current one-sequence probe. sentence_mean: split each "
+            "example into sentences, encode each sentence, then mean-pool."
+        ),
+    )
+    parser.add_argument(
+        "--max_sentences_per_text",
+        type=int,
+        default=None,
+        help="Sentence cap for sentence_mean mode. Defaults to data.max_sentences.",
+    )
+    parser.add_argument(
+        "--encode_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for frozen encoder inference. Defaults to --batch_size.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -204,6 +337,10 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(cfg["data"]["tokenizer"], use_fast=True)
     max_length = cfg["encoder"]["max_seq_len"]
     embedding_dim = get_embedding_dim(cfg)
+    encode_batch_size = args.encode_batch_size or args.batch_size
+    max_sentences_per_text = args.max_sentences_per_text
+    if max_sentences_per_text is None:
+        max_sentences_per_text = cfg["data"].get("max_sentences")
 
     # Load dataset
     print(f"\nLoading MTEB task: {args.task}")
@@ -214,12 +351,34 @@ def main():
     print(f"  Train: {len(train_texts):,} samples")
     print(f"  Test:  {len(test_texts):,} samples")
     print(f"  Classes: {num_classes}")
+    print(f"  Embedding mode: {args.embedding_mode}")
+    if args.embedding_mode == "sentence_mean":
+        print(f"  Max sentences/text: {max_sentences_per_text}")
+        print(f"  Encode batch size: {encode_batch_size}")
 
     # Encode all texts (one-time cost with frozen encoder)
     print("\nEncoding train set...")
-    train_embs = encode_texts(encoder, tokenizer, train_texts, max_length, device, args.batch_size)
+    train_embs = encode_texts(
+        encoder,
+        tokenizer,
+        train_texts,
+        max_length,
+        device,
+        encode_batch_size,
+        embedding_mode=args.embedding_mode,
+        max_sentences=max_sentences_per_text,
+    )
     print("Encoding test set...")
-    test_embs = encode_texts(encoder, tokenizer, test_texts, max_length, device, args.batch_size)
+    test_embs = encode_texts(
+        encoder,
+        tokenizer,
+        test_texts,
+        max_length,
+        device,
+        encode_batch_size,
+        embedding_mode=args.embedding_mode,
+        max_sentences=max_sentences_per_text,
+    )
 
     if train_embs.size(1) != embedding_dim:
         print(
@@ -327,13 +486,20 @@ def main():
 
     # Save best model
     os.makedirs(args.output, exist_ok=True)
-    model_path = os.path.join(args.output, f"{args.task}_linear_probe.pt")
+    output_name = (
+        args.task
+        if args.embedding_mode == "single"
+        else f"{args.task}_{args.embedding_mode}"
+    )
+    model_path = os.path.join(args.output, f"{output_name}_linear_probe.pt")
     torch.save({
         "linear_state_dict": best_state,
         "embedding_dim": embedding_dim,
         "num_classes": num_classes,
         "label_names": label_names,
         "task": args.task,
+        "embedding_mode": args.embedding_mode,
+        "max_sentences_per_text": max_sentences_per_text,
         "best_test_accuracy": best_acc,
         "best_epoch": best_epoch,
         "encoder_checkpoint": args.checkpoint,
@@ -355,9 +521,12 @@ def main():
         "weight_decay": args.weight_decay,
         "checkpoint": args.checkpoint,
         "embedding_dim": embedding_dim,
+        "embedding_mode": args.embedding_mode,
+        "max_sentences_per_text": max_sentences_per_text,
+        "encode_batch_size": encode_batch_size,
     }
 
-    output_path = os.path.join(args.output, f"{args.task}_linear_probe.json")
+    output_path = os.path.join(args.output, f"{output_name}_linear_probe.json")
     with open(output_path, "w") as f:
         json.dump(result, f, indent=2)
 

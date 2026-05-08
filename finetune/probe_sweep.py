@@ -8,6 +8,13 @@ Usage:
         --device cuda \
         --epochs 20 \
         --batch_size 256
+
+    python -m finetune.probe_sweep \
+        --config configs/colab.yaml \
+        --checkpoint_dir /content/drive/MyDrive/SentenceJEPAModel \
+        --task AmazonPolarityClassification \
+        --embedding_mode sentence_mean \
+        --encode_batch_size 64
 """
 
 import argparse
@@ -319,6 +326,27 @@ def main():
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--max_test_samples", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--embedding_mode",
+        choices=["single", "sentence_mean"],
+        default="single",
+        help=(
+            "single: current one-sequence probe. sentence_mean: split each "
+            "example into sentences, encode each sentence, then mean-pool."
+        ),
+    )
+    parser.add_argument(
+        "--max_sentences_per_text",
+        type=int,
+        default=None,
+        help="Sentence cap for sentence_mean mode. Defaults to data.max_sentences.",
+    )
+    parser.add_argument(
+        "--encode_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for frozen encoder inference. Defaults to --batch_size.",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -358,6 +386,20 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(cfg["data"]["tokenizer"], use_fast=True)
     max_length = cfg["encoder"]["max_seq_len"]
     config_embedding_dim = get_embedding_dim(cfg)
+    encode_batch_size = args.encode_batch_size or args.batch_size
+    max_sentences_per_text = args.max_sentences_per_text
+    if max_sentences_per_text is None:
+        max_sentences_per_text = cfg["data"].get("max_sentences")
+    output_name = (
+        args.task
+        if args.embedding_mode == "single"
+        else f"{args.task}_{args.embedding_mode}"
+    )
+
+    print(f"  Embedding mode: {args.embedding_mode}")
+    if args.embedding_mode == "sentence_mean":
+        print(f"  Max sentences/text: {max_sentences_per_text}")
+        print(f"  Encode batch size: {encode_batch_size}")
 
     results = []
     for idx, checkpoint_path in enumerate(checkpoints, start=1):
@@ -366,11 +408,25 @@ def main():
 
         print("  Encoding train set...")
         train_embs = encode_texts(
-            encoder, tokenizer, train_texts, max_length, device, args.batch_size
+            encoder,
+            tokenizer,
+            train_texts,
+            max_length,
+            device,
+            encode_batch_size,
+            embedding_mode=args.embedding_mode,
+            max_sentences=max_sentences_per_text,
         )
         print("  Encoding test set...")
         test_embs = encode_texts(
-            encoder, tokenizer, test_texts, max_length, device, args.batch_size
+            encoder,
+            tokenizer,
+            test_texts,
+            max_length,
+            device,
+            encode_batch_size,
+            embedding_mode=args.embedding_mode,
+            max_sentences=max_sentences_per_text,
         )
 
         embedding_dim = train_embs.size(1)
@@ -406,7 +462,10 @@ def main():
             "epochs": args.epochs,
             "lr": args.lr,
             "batch_size": args.batch_size,
+            "encode_batch_size": encode_batch_size,
             "weight_decay": args.weight_decay,
+            "embedding_mode": args.embedding_mode,
+            "max_sentences_per_text": max_sentences_per_text,
             **diagnostics,
             **probe_result,
         }
@@ -424,8 +483,8 @@ def main():
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        json_path, csv_path = save_results(results, args.output, args.task)
-        plot_path = plot_results(results, args.output, args.task)
+        json_path, csv_path = save_results(results, args.output, output_name)
+        plot_path = plot_results(results, args.output, output_name)
         print(f"  Updated: {json_path}")
         print(f"  Updated: {csv_path}")
         print(f"  Updated: {plot_path}")
