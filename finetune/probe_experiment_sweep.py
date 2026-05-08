@@ -30,6 +30,7 @@ import argparse
 import csv
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
@@ -233,6 +234,31 @@ def load_task_data(task_names, max_train_samples, max_test_samples, seed):
 def choose_default_workers():
     cpu_count = os.cpu_count() or 1
     return max(1, min(8, cpu_count))
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes:d}m{seconds:02d}s"
+    return f"{seconds:d}s"
+
+
+def progress_line(done, total, start_time):
+    elapsed = time.time() - start_time
+    percent = 100.0 * done / total if total else 0.0
+    if done > 0:
+        eta = elapsed * (total - done) / done
+        eta_text = format_duration(eta)
+    else:
+        eta_text = "?"
+    return (
+        f"{done:,}/{total:,} ({percent:5.1f}%) | "
+        f"elapsed={format_duration(elapsed)} | eta={eta_text}"
+    )
 
 
 def configure_torch(device, allow_tf32):
@@ -450,6 +476,7 @@ def get_prepared_batches(
         batch_size,
     )
     if key not in cache:
+        start = time.time()
         print(
             f"      Preparing {task_name}/{split_name}: "
             f"{len(texts):,} examples, mode={embedding_mode}, "
@@ -465,6 +492,10 @@ def get_prepared_batches(
             pin_memory,
             num_workers,
         )
+        print(
+            f"      Prepared {task_name}/{split_name}: "
+            f"{len(cache[key]):,} batches in {format_duration(time.time() - start)}"
+        )
     return cache[key]
 
 
@@ -475,11 +506,15 @@ def encode_prepared_batches(
     embedding_mode,
     amp_enabled,
     amp_dtype,
+    log_prefix=None,
+    log_every=0,
 ):
     """Run frozen encoder over pre-tokenized CPU batches."""
     embeddings = []
+    total_batches = len(batches)
+    start = time.time()
     with torch.inference_mode():
-        for batch in batches:
+        for batch_idx, batch in enumerate(batches, start=1):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             sentence_mask = batch["sentence_mask"].to(device, non_blocking=True)
@@ -496,6 +531,16 @@ def encode_prepared_batches(
                     )
 
             embeddings.append(emb.float().cpu())
+            if log_every and (
+                batch_idx == 1
+                or batch_idx == total_batches
+                or batch_idx % log_every == 0
+            ):
+                prefix = f"{log_prefix}: " if log_prefix else ""
+                print(
+                    f"      {prefix}encoded {batch_idx:,}/{total_batches:,} "
+                    f"batches in {format_duration(time.time() - start)}"
+                )
 
     return torch.cat(embeddings, dim=0)
 
@@ -884,6 +929,12 @@ def main():
         help="Write CSV/JSON progress every N completed rows. Final output is always written.",
     )
     parser.add_argument(
+        "--batch_log_every",
+        type=int,
+        default=10,
+        help="Print encoder inference progress every N prepared batches. Use 0 to disable.",
+    )
+    parser.add_argument(
         "--no_checkpoint_config",
         action="store_true",
         help="Use --config for all encoders instead of the config saved in each checkpoint.",
@@ -941,6 +992,40 @@ def main():
     for directory in experiment_dirs:
         print(f"  {experiment_name(args.root_dir, directory)} -> {directory}")
 
+    experiment_plan = []
+    for directory in experiment_dirs:
+        checkpoints = discover_checkpoints(
+            directory,
+            args.pattern,
+            recursive=args.recursive_checkpoints,
+        )
+        if args.checkpoint_limit is not None:
+            checkpoints = checkpoints[: args.checkpoint_limit]
+        if not checkpoints:
+            continue
+        experiment_plan.append(
+            {
+                "name": experiment_name(args.root_dir, directory),
+                "directory": directory,
+                "checkpoints": checkpoints,
+            }
+        )
+
+    total_checkpoints = sum(len(item["checkpoints"]) for item in experiment_plan)
+    total_jobs = total_checkpoints * len(args.tasks)
+    if total_jobs == 0:
+        raise FileNotFoundError(
+            f"No checkpoints with {args.pattern} found under {args.root_dir}"
+        )
+
+    print(
+        "Planned work: "
+        f"{len(experiment_plan):,} folders, "
+        f"{total_checkpoints:,} checkpoints, "
+        f"{len(args.tasks):,} task(s), "
+        f"{total_jobs:,} total probe jobs"
+    )
+
     task_data = load_task_data(
         args.tasks,
         max_train_samples=args.max_train_samples,
@@ -951,21 +1036,16 @@ def main():
     tokenizer_cache = {}
     prepared_cache = {}
     rows = []
+    completed_jobs = 0
+    run_start = time.time()
 
-    for folder_idx, directory in enumerate(experiment_dirs, start=1):
-        exp_name = experiment_name(args.root_dir, directory)
-        checkpoints = discover_checkpoints(
-            directory,
-            args.pattern,
-            recursive=args.recursive_checkpoints,
-        )
-        if args.checkpoint_limit is not None:
-            checkpoints = checkpoints[: args.checkpoint_limit]
-        if not checkpoints:
-            continue
+    for folder_idx, plan_item in enumerate(experiment_plan, start=1):
+        exp_name = plan_item["name"]
+        directory = plan_item["directory"]
+        checkpoints = plan_item["checkpoints"]
 
         print(
-            f"\n[{folder_idx}/{len(experiment_dirs)}] {exp_name}: "
+            f"\n[{folder_idx}/{len(experiment_plan)}] {exp_name}: "
             f"{len(checkpoints)} checkpoint(s)"
         )
 
@@ -1010,7 +1090,16 @@ def main():
 
             for task_name in args.tasks:
                 data = task_data[task_name]
-                print(f"    Probing {task_name}")
+                job_number = completed_jobs + 1
+                job_start = time.time()
+                print(
+                    f"    Job {job_number:,}/{total_jobs:,} | "
+                    f"{progress_line(completed_jobs, total_jobs, run_start)}"
+                )
+                print(
+                    f"    Probing task={task_name} | "
+                    f"experiment={exp_name} | checkpoint={checkpoint_path.name}"
+                )
 
                 train_batches = get_prepared_batches(
                     prepared_cache,
@@ -1048,6 +1137,8 @@ def main():
                     args.embedding_mode,
                     amp_enabled,
                     amp_dtype,
+                    log_prefix=f"{task_name}/train",
+                    log_every=args.batch_log_every,
                 )
                 test_embs = encode_prepared_batches(
                     encoder,
@@ -1056,6 +1147,8 @@ def main():
                     args.embedding_mode,
                     amp_enabled,
                     amp_dtype,
+                    log_prefix=f"{task_name}/test",
+                    log_every=args.batch_log_every,
                 )
 
                 embedding_dim = train_embs.size(1)
@@ -1133,12 +1226,17 @@ def main():
                     **probe_result,
                 }
                 rows.append(row)
+                completed_jobs += 1
 
                 print(
                     f"      best_test={row['best_test_accuracy']:.4f} | "
                     f"train_at_best={row['train_accuracy_at_best']:.4f} | "
                     f"final_test={row['final_test_accuracy']:.4f} | "
                     f"best_epoch={row['best_epoch']}"
+                )
+                print(
+                    f"      Completed job in {format_duration(time.time() - job_start)} | "
+                    f"{progress_line(completed_jobs, total_jobs, run_start)}"
                 )
 
                 del train_embs, test_embs
