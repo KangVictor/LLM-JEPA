@@ -18,9 +18,11 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 from contextlib import nullcontext
+from pathlib import Path
 
 import mteb
 from mteb.models.model_meta import ModelMeta
@@ -84,6 +86,9 @@ class SentenceJEPAWrapper:
         self.use_amp, self.amp_dtype, self.precision = resolve_precision(
             self.device, precision
         )
+        checkpoint_id = hashlib.sha1(
+            str(Path(checkpoint_path).resolve()).encode("utf-8")
+        ).hexdigest()[:8]
 
         # Load encoder
         self.encoder = SentenceEncoder(cfg).to(self.device)
@@ -103,10 +108,12 @@ class SentenceJEPAWrapper:
         self.tokenizer = AutoTokenizer.from_pretrained(
             cfg["data"]["tokenizer"], use_fast=True
         )
+        step = ckpt.get("step", checkpoint_id)
+        revision = f"step-{step}_{self.embedding_mode}_{checkpoint_id}"
 
         self._mteb_model_meta = ModelMeta.create_empty(overwrites={
             "name": "SentenceJEPA-Small",
-            "revision": "1",
+            "revision": revision,
             "framework": ["PyTorch"],
             "embed_dim": get_embedding_dim(cfg),
             "max_tokens": cfg["encoder"]["max_seq_len"],
@@ -114,8 +121,8 @@ class SentenceJEPAWrapper:
             "open_weights": True,
         })
 
-        step = ckpt.get("step", "?")
         print(f"Loaded encoder from {checkpoint_path} (step {step})")
+        print(f"MTEB cache identity: SentenceJEPA-Small / {revision}")
         print(
             f"Embedding mode: {self.embedding_mode}, "
             f"max_sentences_per_text={self.max_sentences_per_text}, "
@@ -288,6 +295,15 @@ def main():
         default="auto",
         help="Autocast precision for encoder inference.",
     )
+    parser.add_argument(
+        "--overwrite_strategy",
+        choices=["always", "never", "only-missing", "only-cache"],
+        default="always",
+        help=(
+            "MTEB cache overwrite policy. Default 'always' avoids accidentally "
+            "reusing results from a different checkpoint."
+        ),
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -306,14 +322,20 @@ def main():
     tasks = mteb.get_tasks(tasks=[args.task])
     print(f"\nRunning MTEB task: {args.task}")
 
-    results = mteb.evaluate(model, tasks=tasks)
+    results = mteb.evaluate(
+        model,
+        tasks=tasks,
+        encode_kwargs={"batch_size": args.batch_size},
+        overwrite_strategy=args.overwrite_strategy,
+    )
 
     # Save results
     os.makedirs(args.output, exist_ok=True)
+    checkpoint_name = Path(args.checkpoint).stem
     output_name = (
-        args.task
+        f"{args.task}_{checkpoint_name}"
         if args.embedding_mode == "single"
-        else f"{args.task}_{args.embedding_mode}"
+        else f"{args.task}_{args.embedding_mode}_{checkpoint_name}"
     )
     output_path = os.path.join(args.output, f"{output_name}.json")
 
