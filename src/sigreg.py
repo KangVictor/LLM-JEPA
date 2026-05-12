@@ -30,9 +30,9 @@ class SIGReg(nn.Module):
         """Compute LeWM-style SIGReg loss.
 
         Args:
-            embeddings: (T, B, D) tensor of sentence embeddings, or (N, D)
+            embeddings: (S, B, D) tensor of sentence embeddings, or (N, D)
                 for a single pooled step.
-            mask: optional (T, B) bool tensor marking real embeddings.
+            mask: optional (S, B) bool tensor marking real embeddings.
 
         Returns:
             loss: scalar — Epps-Pulley statistic averaged over projections/time
