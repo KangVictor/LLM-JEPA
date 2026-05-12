@@ -27,22 +27,22 @@ class SIGReg(nn.Module):
         self.register_buffer("weights", weights * window)
 
     def forward(self, embeddings, mask=None):
-        """Compute LeWM-style SIGReg loss.
+        """Compute sample-count-normalized SIGReg loss.
 
         Args:
             embeddings: (S, B, D) tensor of sentence embeddings, or (N, D)
-                for a single pooled step.
+                for one global set of valid sentence embeddings.
             mask: optional (S, B) bool tensor marking real embeddings.
 
         Returns:
-            loss: scalar — Epps-Pulley statistic averaged over projections/time
+            loss: scalar, averaged over projections and valid sample groups.
         """
         if embeddings.dim() == 2:
             embeddings = embeddings.unsqueeze(0)
             if mask is not None:
                 mask = mask.unsqueeze(0)
 
-        T, B, D = embeddings.shape
+        S, B, D = embeddings.shape
         if B < 2:
             return embeddings.new_tensor(0.0)
 
@@ -50,11 +50,11 @@ class SIGReg(nn.Module):
         A = torch.randn(D, self.num_projections, device=embeddings.device)
         A = A.div_(A.norm(p=2, dim=0))
 
-        # Project: (T, B, num_projections)
+        # Project: (S, B, num_projections)
         proj = embeddings @ A
 
         # Epps-Pulley characteristic function test
-        # x_t: (T, B, num_projections, knots)
+        # x_t: (S, B, num_projections, knots)
         x_t = proj.unsqueeze(-1) * self.t
 
         # Compare empirical characteristic function to Gaussian phi(t) = exp(-t^2/2)
@@ -62,20 +62,20 @@ class SIGReg(nn.Module):
         # Imaginary part: E[sin(x*t)] should equal 0
         if mask is None:
             err = (x_t.cos().mean(1) - self.phi).square() + x_t.sin().mean(1).square()
-            batch_counts = embeddings.new_full((T,), B)
-            valid_steps = torch.ones(T, dtype=torch.bool, device=embeddings.device)
+            valid_steps = torch.ones(S, dtype=torch.bool, device=embeddings.device)
         else:
             mask = mask.to(dtype=torch.bool, device=embeddings.device)
             mask_weights = mask[:, :, None, None].to(dtype=x_t.dtype)
-            batch_counts = mask_weights.sum(dim=1).squeeze(-1).squeeze(-1)
-            denom = batch_counts.clamp(min=1).view(T, 1, 1)
+            sample_counts = mask_weights.sum(dim=1).squeeze(-1).squeeze(-1)
+            denom = sample_counts.clamp(min=1).view(S, 1, 1)
             cos_mean = (x_t.cos() * mask_weights).sum(dim=1) / denom
             sin_mean = (x_t.sin() * mask_weights).sum(dim=1) / denom
             err = (cos_mean - self.phi).square() + sin_mean.square()
-            valid_steps = batch_counts >= 2
+            valid_steps = sample_counts >= 2
 
-        # Weighted integration over t
-        statistic = (err @ self.weights) * batch_counts[:, None]
+        # Weighted integration over t. Do not multiply by sample count: the
+        # empirical characteristic function already averages over samples.
+        statistic = err @ self.weights
         if not valid_steps.any():
             return embeddings.new_tensor(0.0)
         statistic = statistic[valid_steps]

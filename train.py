@@ -173,9 +173,8 @@ def compute_losses(model, batch, cfg, sigreg, amp_dtype, use_amp):
         loss_pred = F.mse_loss(pred_out, targets)
 
         if sigreg is not None:
-            sigreg_embs = enc_out.transpose(0, 1)  # (S, B, D)
-            sigreg_mask = sentence_mask.transpose(0, 1)  # (S, B)
-            loss_sig = sigreg(sigreg_embs, sigreg_mask)
+            sigreg_embs = enc_out[sentence_mask]  # (N_valid_sentences, D)
+            loss_sig = sigreg(sigreg_embs)
             loss_total = loss_pred + cfg["sigreg"]["weight"] * loss_sig
         else:
             loss_sig = enc_out.new_tensor(0.0)
