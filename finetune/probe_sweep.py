@@ -14,7 +14,9 @@ Usage:
         --checkpoint_dir /content/drive/MyDrive/SentenceJEPAModel \
         --task AmazonPolarityClassification \
         --embedding_mode sentence_mean \
-        --encode_batch_size 64
+        --encode_batch_size 64 \
+        --early_stop_patience 5 \
+        --min_checkpoint_step 30000
 """
 
 import argparse
@@ -60,6 +62,26 @@ def discover_checkpoints(checkpoint_dir, pattern, recursive):
         )
     )
     return checkpoints
+
+
+def filter_checkpoints_by_min_step(checkpoints, min_step):
+    """Drop checkpoints whose filename step is known and below min_step."""
+    if min_step is None:
+        return checkpoints, 0, 0
+
+    kept = []
+    skipped = 0
+    kept_unknown = 0
+    for path in checkpoints:
+        step = checkpoint_step_from_name(path)
+        if step is None:
+            kept.append(path)
+            kept_unknown += 1
+        elif step >= min_step:
+            kept.append(path)
+        else:
+            skipped += 1
+    return kept, skipped, kept_unknown
 
 
 def normalize_step(step):
@@ -120,6 +142,9 @@ def train_probe(
     batch_size,
     device,
     seed,
+    early_stop_patience=0,
+    early_stop_min_delta=0.0,
+    early_stop_min_epochs=0,
 ):
     """Train a linear classifier on frozen embeddings and return accuracy stats."""
     train_embs = F.normalize(train_embs, dim=1)
@@ -153,6 +178,8 @@ def train_probe(
     best_epoch = 0
     final_train_acc = 0.0
     final_test_acc = 0.0
+    epochs_without_improvement = 0
+    stopped_early = False
     history = []
 
     for epoch in range(epochs):
@@ -200,10 +227,21 @@ def train_probe(
             "test_accuracy": test_acc,
         })
 
-        if test_acc > best_test_acc:
+        if test_acc > best_test_acc + early_stop_min_delta:
             best_test_acc = test_acc
             best_train_acc = train_acc
             best_epoch = epoch + 1
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if (
+            early_stop_patience > 0
+            and epoch + 1 >= early_stop_min_epochs
+            and epochs_without_improvement >= early_stop_patience
+        ):
+            stopped_early = True
+            break
 
     return {
         "best_test_accuracy": best_test_acc,
@@ -211,6 +249,11 @@ def train_probe(
         "best_epoch": best_epoch,
         "final_train_accuracy": final_train_acc,
         "final_test_accuracy": final_test_acc,
+        "epochs_trained": len(history),
+        "stopped_early": stopped_early,
+        "early_stop_patience": early_stop_patience,
+        "early_stop_min_delta": early_stop_min_delta,
+        "early_stop_min_epochs": early_stop_min_epochs,
         "epoch_history": history,
     }
 
@@ -327,6 +370,36 @@ def main():
     parser.add_argument("--max_test_samples", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
+        "--min_checkpoint_step",
+        type=int,
+        default=None,
+        help=(
+            "Skip checkpoints whose filename step is below this value. "
+            "Checkpoints without a parseable step are kept."
+        ),
+    )
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=0,
+        help=(
+            "Stop linear-probe training after this many epochs without a test "
+            "accuracy improvement greater than --early_stop_min_delta. 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--early_stop_min_delta",
+        type=float,
+        default=0.0,
+        help="Minimum test accuracy improvement required to reset early stopping.",
+    )
+    parser.add_argument(
+        "--early_stop_min_epochs",
+        type=int,
+        default=0,
+        help="Do not early-stop before this many probe epochs have completed.",
+    )
+    parser.add_argument(
         "--embedding_mode",
         choices=["single", "sentence_mean"],
         default="single",
@@ -356,6 +429,15 @@ def main():
     checkpoints = discover_checkpoints(
         args.checkpoint_dir, args.pattern, args.recursive
     )
+    checkpoints, skipped_early, kept_unknown = filter_checkpoints_by_min_step(
+        checkpoints, args.min_checkpoint_step
+    )
+    if args.min_checkpoint_step is not None:
+        print(
+            f"Checkpoint step filter: kept {len(checkpoints)}, "
+            f"skipped {skipped_early} below step {args.min_checkpoint_step}, "
+            f"kept {kept_unknown} with unknown step"
+        )
     if args.limit is not None:
         checkpoints = checkpoints[:args.limit]
     if not checkpoints:
@@ -449,6 +531,9 @@ def main():
             batch_size=args.batch_size,
             device=device,
             seed=args.seed,
+            early_stop_patience=args.early_stop_patience,
+            early_stop_min_delta=args.early_stop_min_delta,
+            early_stop_min_epochs=args.early_stop_min_epochs,
         )
 
         row = {
@@ -476,7 +561,9 @@ def main():
             f"best_test={row['best_test_accuracy']:.4f} "
             f"train_at_best={row['train_accuracy_at_best']:.4f} "
             f"final_test={row['final_test_accuracy']:.4f} "
-            f"best_epoch={row['best_epoch']}"
+            f"best_epoch={row['best_epoch']} "
+            f"epochs_trained={row['epochs_trained']}/{args.epochs} "
+            f"stopped_early={row['stopped_early']}"
         )
 
         del encoder, train_embs, test_embs
