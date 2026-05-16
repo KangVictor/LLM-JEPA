@@ -16,6 +16,7 @@ Supported sources:
     wikipedia    -> wikimedia/wikipedia 20231101.en, English articles.
     openwebtext  -> Skylion007/openwebtext, English web documents.
     bookcorpus   -> kd13/bookcorpus-clean, English ordered book sentences.
+    c4           -> allenai/c4 en, cleaned English Common Crawl documents.
 
 Excluded source:
     opensubtitles -> intentionally unsupported for this JEPA setup. Subtitle
@@ -104,6 +105,18 @@ SOURCE_SPECS = {
             "English BookCorpus-clean rows with doc_id/sent_id; contiguous "
             "sentences are grouped into pseudo-paragraphs."
         ),
+    ),
+    "c4": SourceSpec(
+        name="c4",
+        dataset="allenai/c4",
+        split="train",
+        text_column="text",
+        mode="documents",
+        description=(
+            "C4 English cleaned Common Crawl documents; sentence windows are "
+            "extracted from each text field."
+        ),
+        config="en",
     ),
     "opensubtitles": SourceSpec(
         name="opensubtitles",
