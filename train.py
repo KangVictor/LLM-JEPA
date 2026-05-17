@@ -6,7 +6,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from src.data import WikiParagraphDataset, collate_fn, summarize_dataset, load_preprocessed
 from src.logging_utils import compute_metrics, log_step, log_val
@@ -276,11 +276,12 @@ def main():
 
     if cfg["data"].get("preprocessed_path"):
         train_dataset, val_samples, num_train = load_preprocessed(cfg)
+        is_iterable_train = isinstance(train_dataset, IterableDataset)
         loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             collate_fn=collate_fn,
-            shuffle=True,
+            shuffle=not is_iterable_train,
             num_workers=cfg["data"]["num_workers"],
             pin_memory=True,
             drop_last=True,

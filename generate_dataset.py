@@ -666,6 +666,68 @@ def load_samples_from_shards(output, quotas=None, log_every=10):
     return all_samples
 
 
+def iter_samples_from_shards(output, quotas=None, log_every=10):
+    """Yield samples from saved source shards without retaining them all."""
+    all_paths = shard_files(output)
+    if not all_paths:
+        raise FileNotFoundError(f"No shard_*.pt files found under {Path(output) / 'shards'}")
+
+    print(f"  Found {len(all_paths):,} shard files under {Path(output) / 'shards'}")
+    by_source = defaultdict(int)
+    for path in all_paths:
+        by_source[path.parent.name] += 1
+    for source, count in sorted(by_source.items()):
+        target = quotas.get(source) if quotas is not None else None
+        target_text = f", quota={target:,}" if target is not None else ""
+        print(f"    {source}: {count:,} shards{target_text}")
+
+    counts = defaultdict(int)
+    total_yielded = 0
+    t0 = time.time()
+    for index, path in enumerate(all_paths, start=1):
+        samples, _ = read_shard(path)
+        kept = 0
+        skipped = 0
+        for sample in samples:
+            source = sample.get("source", path.parent.name)
+            if quotas is not None and source not in quotas:
+                skipped += 1
+                continue
+            if quotas is not None and counts[source] >= quotas[source]:
+                skipped += 1
+                continue
+            counts[source] += 1
+            total_yielded += 1
+            kept += 1
+            yield total_yielded - 1, sample
+
+        if index == 1 or index == len(all_paths) or index % log_every == 0:
+            elapsed = max(time.time() - t0, 1e-6)
+            print(
+                f"  streamed shard {index:,}/{len(all_paths):,}: {path.name} "
+                f"kept={kept:,} skipped={skipped:,} total={total_yielded:,} "
+                f"({total_yielded / elapsed:.1f} samples/s)"
+            )
+            for source in sorted(counts):
+                if quotas is not None and source in quotas:
+                    print(f"    {source}: {counts[source]:,}/{quotas[source]:,}")
+                else:
+                    print(f"    {source}: {counts[source]:,}")
+
+        if quotas is not None and all(counts[source] >= quotas[source] for source in quotas):
+            print("  Reached all requested source quotas; stopping shard stream.")
+            break
+
+    if quotas is not None:
+        missing = {
+            source: quotas[source] - counts[source]
+            for source in quotas
+            if counts[source] < quotas[source]
+        }
+        if missing:
+            raise RuntimeError(f"Not enough shard samples for requested mix: {missing}")
+
+
 def save_final_dataset(samples, output, val_size, seed, meta_extra=None):
     print(f"  Shuffling {len(samples):,} samples with seed={seed}...")
     random.seed(seed)
@@ -715,6 +777,114 @@ def save_final_dataset(samples, output, val_size, seed, meta_extra=None):
     for name, count in sorted(source_counts.items()):
         print(f"    {name}: {count:,}")
     return train_path, val_path, meta_path
+
+
+def save_sharded_final_dataset(
+    output,
+    quotas,
+    val_size,
+    seed,
+    train_shard_size,
+    log_every=10,
+    meta_extra=None,
+):
+    """Build val.pt and train_shards/*.pt without loading all train samples."""
+    if quotas is None:
+        raise ValueError("Sharded combine requires --total_paragraphs and --mix quotas.")
+    total_samples = sum(quotas.values())
+    if val_size >= total_samples:
+        raise ValueError(
+            f"val_paragraphs={val_size} must be smaller than sample count {total_samples:,}"
+        )
+
+    rng = random.Random(seed)
+    val_indices = set(rng.sample(range(total_samples), val_size))
+    train_dir = Path(output) / "train_shards"
+    if train_dir.exists() and any(train_dir.glob("train_*.pt")):
+        raise FileExistsError(
+            f"Train shard directory already contains train_*.pt files: {train_dir}. "
+            "Choose a new output directory or remove old final train shards."
+        )
+    train_dir.mkdir(parents=True, exist_ok=True)
+
+    val_samples = []
+    train_buffer = []
+    train_paths = []
+    source_counts = defaultdict(int)
+    sentence_count_sum = 0
+    sentence_count_min = None
+    sentence_count_max = None
+    num_train = 0
+    num_val = 0
+
+    def update_meta(sample):
+        nonlocal sentence_count_sum, sentence_count_min, sentence_count_max
+        source_counts[sample.get("source", "unknown")] += 1
+        count = int(sample["num_sentences"])
+        sentence_count_sum += count
+        sentence_count_min = count if sentence_count_min is None else min(sentence_count_min, count)
+        sentence_count_max = count if sentence_count_max is None else max(sentence_count_max, count)
+
+    def flush_train_shard(force=False):
+        nonlocal train_buffer
+        if not train_buffer:
+            return
+        if not force and len(train_buffer) < train_shard_size:
+            return
+        shard_index = len(train_paths)
+        path = train_dir / f"train_{shard_index:06d}.pt"
+        tmp_path = train_dir / f"train_{shard_index:06d}.tmp"
+        torch.save(train_buffer, tmp_path)
+        os.replace(tmp_path, path)
+        train_paths.append(str(path))
+        print(f"  wrote {path} ({len(train_buffer):,} samples)")
+        train_buffer = []
+
+    print(f"  Selecting exactly {val_size:,} validation samples by seeded global index.")
+    print(f"  Writing train shards of {train_shard_size:,} samples to {train_dir}")
+    t0 = time.time()
+    for global_index, sample in iter_samples_from_shards(output, quotas, log_every=log_every):
+        update_meta(sample)
+        if global_index in val_indices:
+            val_samples.append(sample)
+            num_val += 1
+        else:
+            train_buffer.append(sample)
+            num_train += 1
+            flush_train_shard()
+
+    flush_train_shard(force=True)
+    if num_val != val_size:
+        raise RuntimeError(f"Expected {val_size:,} val samples, got {num_val:,}")
+
+    meta = {
+        "format": "sharded_train",
+        "num_paragraphs": num_train + num_val,
+        "num_train": num_train,
+        "num_val": num_val,
+        "train_shards": train_paths,
+        "train_shard_size": train_shard_size,
+        "source_counts": dict(source_counts),
+        "sentence_count_mean": sentence_count_sum / max(1, num_train + num_val),
+        "sentence_count_min": sentence_count_min,
+        "sentence_count_max": sentence_count_max,
+    }
+    if meta_extra:
+        meta.update(meta_extra)
+
+    val_path = os.path.join(output, "val.pt")
+    meta_path = os.path.join(output, "meta.pt")
+    print("\nSaving sharded final dataset...")
+    print(f"  writing {val_path} ({len(val_samples):,} samples) ...")
+    torch.save(val_samples, val_path)
+    print(f"  writing {meta_path} ...")
+    torch.save(meta, meta_path)
+
+    elapsed = time.time() - t0
+    print("\nSharded final dataset saved.")
+    print(f"  Train samples: {num_train:,} in {len(train_paths):,} shards")
+    print(f"  Val samples:   {num_val:,}")
+    print(f"  Elapsed:       {elapsed:.0f}s")
 
 
 def list_sources():
@@ -767,6 +937,21 @@ def main():
         type=int,
         default=10,
         help="Print combine progress every N shard files.",
+    )
+    parser.add_argument(
+        "--combine_format",
+        choices=("monolithic", "sharded"),
+        default="monolithic",
+        help=(
+            "monolithic writes train.pt; sharded writes train_shards/*.pt and "
+            "keeps combine memory much lower."
+        ),
+    )
+    parser.add_argument(
+        "--final_train_shard_size",
+        type=int,
+        default=100000,
+        help="Number of train samples per final train shard when --combine_format=sharded.",
     )
     parser.add_argument("--min_chars", type=int, default=20)
     parser.add_argument("--resume", action="store_true")
@@ -845,6 +1030,30 @@ def main():
             print("  Requested mix quotas:")
             for name, quota in quotas.items():
                 print(f"    {name}: {quota:,}")
+        meta_extra = {
+            "mix": proportions if quotas is not None else None,
+            "quotas": quotas,
+            "excluded_sources": {
+                name: spec.reason
+                for name, spec in SOURCE_SPECS.items()
+                if not spec.supported
+            },
+            "tokenizer": cfg["data"]["tokenizer"],
+            "max_tokens_per_sentence": cfg["data"]["max_tokens_per_sentence"],
+            "min_sentences": cfg["data"]["min_sentences"],
+            "max_sentences": cfg["data"]["max_sentences"],
+        }
+        if args.combine_format == "sharded":
+            save_sharded_final_dataset(
+                args.output,
+                quotas,
+                val_size,
+                args.seed,
+                args.final_train_shard_size,
+                log_every=max(1, args.combine_log_every),
+                meta_extra=meta_extra,
+            )
+            return
         all_samples = load_samples_from_shards(
             args.output,
             quotas,
@@ -860,19 +1069,7 @@ def main():
             args.output,
             val_size,
             args.seed,
-            {
-                "mix": proportions if quotas is not None else None,
-                "quotas": quotas,
-                "excluded_sources": {
-                    name: spec.reason
-                    for name, spec in SOURCE_SPECS.items()
-                    if not spec.supported
-                },
-                "tokenizer": cfg["data"]["tokenizer"],
-                "max_tokens_per_sentence": cfg["data"]["max_tokens_per_sentence"],
-                "min_sentences": cfg["data"]["min_sentences"],
-                "max_sentences": cfg["data"]["max_sentences"],
-            },
+            meta_extra,
         )
         return
 

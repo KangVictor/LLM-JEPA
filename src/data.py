@@ -1,5 +1,6 @@
 import os
 import re
+import random
 
 import torch
 from torch.utils.data import Dataset, IterableDataset
@@ -193,6 +194,41 @@ class PreprocessedDataset(Dataset):
         return self.samples[idx]
 
 
+class ShardedPreprocessedDataset(IterableDataset):
+    """Iterable dataset backed by final train_shards/*.pt files."""
+
+    def __init__(self, shard_paths, num_samples, seed=42, shuffle=True):
+        super().__init__()
+        self.shard_paths = list(shard_paths)
+        self.num_samples = int(num_samples)
+        self.seed = int(seed)
+        self.shuffle = shuffle
+
+    def __len__(self):
+        return self.num_samples
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        paths = list(self.shard_paths)
+        rng = random.Random(self.seed)
+        if self.shuffle:
+            rng.shuffle(paths)
+
+        if worker_info is not None:
+            paths = paths[worker_info.id :: worker_info.num_workers]
+            rng = random.Random(self.seed + worker_info.id)
+
+        for path in paths:
+            samples = torch.load(path, weights_only=False)
+            if isinstance(samples, dict):
+                samples = samples["samples"]
+            indices = list(range(len(samples)))
+            if self.shuffle:
+                rng.shuffle(indices)
+            for idx in indices:
+                yield samples[idx]
+
+
 def format_meta_value(value):
     """Format preprocessed metadata without assuming every value is scalar."""
     if isinstance(value, bool):
@@ -224,12 +260,38 @@ def load_preprocessed(cfg):
     path = cfg["data"]["preprocessed_path"]
     print(f"Loading preprocessed data from {path}/...")
 
-    train_samples = torch.load(os.path.join(path, "train.pt"), weights_only=False)
     val_samples = torch.load(os.path.join(path, "val.pt"), weights_only=False)
     meta = torch.load(os.path.join(path, "meta.pt"), weights_only=False)
+    train_path = os.path.join(path, "train.pt")
+    train_shard_dir = os.path.join(path, "train_shards")
+    if os.path.exists(train_path):
+        train_samples = torch.load(train_path, weights_only=False)
+        train_dataset = PreprocessedDataset(train_samples)
+        num_train = len(train_samples)
+    elif os.path.isdir(train_shard_dir):
+        shard_paths = sorted(
+            os.path.join(train_shard_dir, name)
+            for name in os.listdir(train_shard_dir)
+            if name.startswith("train_") and name.endswith(".pt")
+        )
+        if not shard_paths:
+            raise FileNotFoundError(f"No train_*.pt shards found in {train_shard_dir}")
+        num_train = int(meta.get("num_train", 0))
+        if num_train <= 0:
+            raise ValueError("Sharded dataset meta.pt must contain a positive num_train")
+        train_dataset = ShardedPreprocessedDataset(
+            shard_paths,
+            num_train,
+            seed=cfg["training"].get("seed", 42),
+            shuffle=True,
+        )
+    else:
+        raise FileNotFoundError(
+            f"Expected either {train_path} or {train_shard_dir}/train_*.pt"
+        )
 
     batch_size = cfg["training"]["batch_size"]
-    steps_per_epoch = len(train_samples) // batch_size
+    steps_per_epoch = num_train // batch_size
 
     print(f"\n{'='*50}")
     print(f"Preprocessed Dataset Summary")
@@ -239,7 +301,7 @@ def load_preprocessed(cfg):
     print(f"  Steps/epoch (bs={batch_size}): {steps_per_epoch:,}")
     print(f"{'='*50}\n")
 
-    return PreprocessedDataset(train_samples), val_samples, len(train_samples)
+    return train_dataset, val_samples, num_train
 
 
 def collate_fn(batch):
