@@ -189,8 +189,7 @@ def validate(model, val_loader, cfg, device, amp_dtype, use_amp, sigreg=None):
     model.eval()
     total_pred, total_sig, total_loss, num_batches = 0.0, 0.0, 0.0, 0
 
-    all_enc = []
-    all_smask = []
+    metric_embs = []
 
     for batch in val_loader:
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -217,8 +216,11 @@ def validate(model, val_loader, cfg, device, amp_dtype, use_amp, sigreg=None):
         total_sig += loss_sig.item()
         total_loss += loss_total.item()
         num_batches += 1
-        all_enc.append(enc_out)
-        all_smask.append(sentence_mask)
+        if len(metric_embs) < 4:
+            metric_embs.append(enc_out[sentence_mask].detach())
+        else:
+            metric_embs.pop(0)
+            metric_embs.append(enc_out[sentence_mask].detach())
 
     model.train()
 
@@ -230,9 +232,15 @@ def validate(model, val_loader, cfg, device, amp_dtype, use_amp, sigreg=None):
         "prediction": total_pred / num_batches,
         "sigreg": total_sig / num_batches,
     }
-    # Metrics from last few batches (cap memory usage)
-    enc_cat = torch.cat(all_enc[-4:], dim=0)
-    smask_cat = torch.cat(all_smask[-4:], dim=0)
+    # Metrics from last few batches (cap memory usage). Validation batches can
+    # have different sentence counts, so concatenate flattened valid embeddings.
+    embs_cat = torch.cat(metric_embs, dim=0)
+    enc_cat = embs_cat.unsqueeze(1)
+    smask_cat = torch.ones(
+        enc_cat.shape[:2],
+        dtype=torch.bool,
+        device=enc_cat.device,
+    )
     metrics = compute_metrics(enc_cat, smask_cat)
 
     return losses, metrics
