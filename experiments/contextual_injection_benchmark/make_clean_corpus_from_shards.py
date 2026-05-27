@@ -167,7 +167,15 @@ def convert(args):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 
     shard_files = discover_shard_files(args.input_path, args.split, args.pattern)
-    if args.shuffle_files:
+    total_shard_files = len(shard_files)
+    if args.sample_strategy == "random_shards":
+        if args.num_random_shards <= 0:
+            raise ValueError("--num_random_shards must be positive.")
+        num_selected = min(args.num_random_shards, len(shard_files))
+        shard_files = rng.sample(shard_files, num_selected)
+    elif args.shuffle_files:
+        rng.shuffle(shard_files)
+    if args.sample_strategy == "random_shards" and args.shuffle_files:
         rng.shuffle(shard_files)
 
     allowed_sources = None
@@ -183,9 +191,16 @@ def convert(args):
     started = time.time()
 
     print(f"Tokenizer: {tokenizer_name}")
-    print(f"Input files: {len(shard_files):,}")
+    print(f"Input files discovered: {total_shard_files:,}")
+    print(f"Input files selected:   {len(shard_files):,}")
     print(f"Output: {output_path}")
-    if args.max_examples is not None and args.sample_strategy == "reservoir":
+    if args.sample_strategy == "random_shards":
+        print(
+            "Sampling strategy: random_shards; selected "
+            f"{len(shard_files):,} random shard(s). With --max_examples, "
+            "reservoir sampling is applied within those selected shards."
+        )
+    elif args.max_examples is not None and args.sample_strategy == "reservoir":
         print(
             "Sampling strategy: reservoir; scanning every shard to draw an "
             "approximately uniform random clean corpus."
@@ -196,7 +211,10 @@ def convert(args):
             "--max_examples for an unbiased random subset."
         )
 
-    if args.max_examples is not None and args.sample_strategy == "reservoir":
+    if args.max_examples is not None and args.sample_strategy in (
+        "reservoir",
+        "random_shards",
+    ):
         reservoir = []
         eligible = 0
         for file_index, shard_path in enumerate(shard_files, start=1):
@@ -366,12 +384,19 @@ def parse_args():
     parser.add_argument(
         "--sample_strategy",
         type=str,
-        default="reservoir",
-        choices=("first", "reservoir"),
+        default="random_shards",
+        choices=("first", "reservoir", "random_shards"),
         help=(
-            "With --max_examples, reservoir scans all shards and writes a random "
-            "subset. first stops after the first eligible examples."
+            "random_shards selects --num_random_shards shard files and samples "
+            "within them. reservoir scans all shards and writes a random subset. "
+            "first stops after the first eligible examples."
         ),
+    )
+    parser.add_argument(
+        "--num_random_shards",
+        type=int,
+        default=16,
+        help="Number of shard files to sample when --sample_strategy=random_shards.",
     )
     parser.add_argument("--shuffle_files", action="store_true")
     parser.add_argument("--shuffle_within_shard", action="store_true")

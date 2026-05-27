@@ -27,10 +27,17 @@ python experiments/contextual_injection_benchmark/make_clean_corpus_from_shards.
   --input_path /path/to/preprocessed_dataset \
   --output_path experiments/contextual_injection_benchmark/outputs/clean_corpus.jsonl \
   --split train \
-  --max_examples 10000
+  --max_examples 10000 \
+  --sample_strategy random_shards \
+  --num_random_shards 32
 ```
 
-With `--max_examples`, the default `--sample_strategy reservoir` scans all matching shards and writes a random subset. This avoids taking only `train_000000.pt`, `train_000001.pt`, and so on. If you want the old fast sequential behavior, pass `--sample_strategy first`.
+The default `--sample_strategy random_shards` selects a fixed number of random shard files, then samples examples from those selected shards. This is much faster than scanning every shard and is usually good enough for a benchmark clean corpus. Increase `--num_random_shards` if the output is too source-skewed or if many selected rows are filtered out.
+
+Other strategies:
+
+- `--sample_strategy reservoir`: scan all matching shards and draw an approximately uniform random subset.
+- `--sample_strategy first`: take the first eligible examples and stop quickly.
 
 For a final sharded dataset this reads `train_shards/train_*.pt` by default. For source shards created before final combine, use:
 
