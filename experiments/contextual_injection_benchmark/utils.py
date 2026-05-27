@@ -59,7 +59,7 @@ def paragraph_to_sentences(text: str) -> list[str]:
     text = text.strip()
     if not text:
         return []
-    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z"])', text)
+    sentences = re.split(r"(?<=[.!?])\s+", text)
     return clean_sentence_list(sentences)
 
 

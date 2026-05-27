@@ -8,6 +8,7 @@ from pathlib import Path
 
 from utils import (
     choose_sentence_window,
+    clean_sentence_list,
     load_payloads,
     paragraph_to_sentences,
     read_jsonl,
@@ -35,8 +36,10 @@ def build_examples(args):
 
     for row in read_jsonl(args.clean_corpus):
         doc_id = str(row.get("doc_id", f"doc_{built + skipped}"))
-        text = row.get("text", "")
-        sentences = paragraph_to_sentences(text)
+        if isinstance(row.get("sentences"), list):
+            sentences = clean_sentence_list(row["sentences"])
+        else:
+            sentences = paragraph_to_sentences(row.get("text", ""))
         sentences = choose_sentence_window(
             sentences,
             min_sentences=args.min_sentences,

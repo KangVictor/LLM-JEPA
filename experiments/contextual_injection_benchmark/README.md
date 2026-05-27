@@ -20,9 +20,30 @@ The payloads are for detection experiments only and are loosely inspired by publ
 
 ## Build A Benchmark
 
+If you already have SentenceJEPA preprocessed shards, first decode them into the clean JSONL format:
+
+```bash
+python experiments/contextual_injection_benchmark/make_clean_corpus_from_shards.py \
+  --input_path /path/to/preprocessed_dataset \
+  --output_path experiments/contextual_injection_benchmark/outputs/clean_corpus.jsonl \
+  --split train \
+  --max_examples 10000
+```
+
+For a final sharded dataset this reads `train_shards/train_*.pt` by default. For source shards created before final combine, use:
+
+```bash
+python experiments/contextual_injection_benchmark/make_clean_corpus_from_shards.py \
+  --input_path /path/to/preprocessed_dataset \
+  --output_path experiments/contextual_injection_benchmark/outputs/clean_corpus.jsonl \
+  --split source_shards
+```
+
+The converter decodes token IDs back into text with the configured tokenizer, so the recovered text is approximate but sufficient for this benchmark. It also writes a `sentences` field so the benchmark builder does not need to recover sentence boundaries from lowercased BERT-decoded text.
+
 ```bash
 python experiments/contextual_injection_benchmark/build_benchmark.py \
-  --clean_corpus data/clean_corpus.jsonl \
+  --clean_corpus experiments/contextual_injection_benchmark/outputs/clean_corpus.jsonl \
   --output_path experiments/contextual_injection_benchmark/outputs/benchmark.jsonl \
   --num_examples 500 \
   --seed 42

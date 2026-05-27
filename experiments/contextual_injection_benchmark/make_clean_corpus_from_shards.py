@@ -187,6 +187,7 @@ def convert(args):
                 row = {
                     "doc_id": f"{source}:{shard_path.stem}:{sample_index}",
                     "text": text,
+                    "sentences": sentences,
                     "metadata": {
                         "source": source,
                         "shard_path": str(shard_path),
