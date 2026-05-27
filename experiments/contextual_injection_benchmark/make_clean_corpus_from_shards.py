@@ -15,10 +15,6 @@ import sys
 import time
 from pathlib import Path
 
-import torch
-import yaml
-from transformers import AutoTokenizer
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -40,6 +36,8 @@ INSTRUCTION_LIKE_PATTERNS = (
 def load_tokenizer_name(config_path, tokenizer_override):
     if tokenizer_override:
         return tokenizer_override
+    import yaml
+
     with Path(config_path).open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     return cfg["data"]["tokenizer"]
@@ -79,6 +77,8 @@ def discover_shard_files(input_path, split, pattern):
 
 
 def read_samples(path):
+    import torch
+
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(payload, list):
         return payload
@@ -126,7 +126,42 @@ def source_from_path(path):
     return path.stem
 
 
+def sample_to_row(tokenizer, sample, source, shard_path, sample_index, args):
+    sentences = decode_sample(
+        tokenizer,
+        sample,
+        max_sentences=args.max_sentences,
+    )
+    if len(sentences) < args.min_sentences:
+        return None
+
+    text = " ".join(sentences)
+    if args.reject_instruction_like and is_instruction_like(text):
+        return None
+
+    return {
+        "doc_id": f"{source}:{shard_path.stem}:{sample_index}",
+        "text": text,
+        "sentences": sentences,
+        "metadata": {
+            "source": source,
+            "shard_path": str(shard_path),
+            "sample_index": sample_index,
+            "num_sentences": len(sentences),
+            "decoded_from_token_ids": True,
+        },
+    }
+
+
+def write_rows(rows, output_path):
+    with Path(output_path).open("w", encoding="utf-8") as out:
+        for row in rows:
+            out.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def convert(args):
+    from transformers import AutoTokenizer
+
     rng = random.Random(args.seed)
     tokenizer_name = load_tokenizer_name(args.config, args.tokenizer)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
@@ -150,6 +185,69 @@ def convert(args):
     print(f"Tokenizer: {tokenizer_name}")
     print(f"Input files: {len(shard_files):,}")
     print(f"Output: {output_path}")
+    if args.max_examples is not None and args.sample_strategy == "reservoir":
+        print(
+            "Sampling strategy: reservoir; scanning every shard to draw an "
+            "approximately uniform random clean corpus."
+        )
+    else:
+        print(
+            "Sampling strategy: first; use --sample_strategy reservoir with "
+            "--max_examples for an unbiased random subset."
+        )
+
+    if args.max_examples is not None and args.sample_strategy == "reservoir":
+        reservoir = []
+        eligible = 0
+        for file_index, shard_path in enumerate(shard_files, start=1):
+            samples = read_samples(shard_path)
+            fallback_source = source_from_path(shard_path)
+            print(
+                f"[{file_index:,}/{len(shard_files):,}] {shard_path} "
+                f"({len(samples):,} samples)"
+            )
+
+            for sample_index, sample in enumerate(samples):
+                scanned += 1
+                source = sample.get("source", fallback_source)
+                if allowed_sources is not None and source not in allowed_sources:
+                    skipped += 1
+                    continue
+
+                row = sample_to_row(
+                    tokenizer,
+                    sample,
+                    source,
+                    shard_path,
+                    sample_index,
+                    args,
+                )
+                if row is None:
+                    skipped += 1
+                    continue
+
+                eligible += 1
+                if len(reservoir) < args.max_examples:
+                    reservoir.append(row)
+                else:
+                    replace_index = rng.randint(0, eligible - 1)
+                    if replace_index < args.max_examples:
+                        reservoir[replace_index] = row
+
+                if eligible % args.log_every == 0:
+                    elapsed = max(time.time() - started, 1e-9)
+                    print(
+                        f"  eligible {eligible:,} | reservoir {len(reservoir):,} | "
+                        f"scanned {scanned:,} | skipped {skipped:,} | "
+                        f"{eligible / elapsed:.1f} eligible rows/s"
+                    )
+
+        rng.shuffle(reservoir)
+        write_rows(reservoir, output_path)
+        written = len(reservoir)
+        print(f"Random sample written to {output_path}")
+        print_summary(written, scanned, skipped, started)
+        return
 
     with output_path.open("w", encoding="utf-8") as out:
         for file_index, shard_path in enumerate(shard_files, start=1):
@@ -170,32 +268,18 @@ def convert(args):
                     skipped += 1
                     continue
 
-                sentences = decode_sample(
+                row = sample_to_row(
                     tokenizer,
                     sample,
-                    max_sentences=args.max_sentences,
+                    source,
+                    shard_path,
+                    sample_index,
+                    args,
                 )
-                if len(sentences) < args.min_sentences:
+                if row is None:
                     skipped += 1
                     continue
 
-                text = " ".join(sentences)
-                if args.reject_instruction_like and is_instruction_like(text):
-                    skipped += 1
-                    continue
-
-                row = {
-                    "doc_id": f"{source}:{shard_path.stem}:{sample_index}",
-                    "text": text,
-                    "sentences": sentences,
-                    "metadata": {
-                        "source": source,
-                        "shard_path": str(shard_path),
-                        "sample_index": sample_index,
-                        "num_sentences": len(sentences),
-                        "decoded_from_token_ids": True,
-                    },
-                }
                 out.write(json.dumps(row, ensure_ascii=False) + "\n")
                 written += 1
 
@@ -279,6 +363,16 @@ def parse_args():
         help="Filter clean rows that already contain obvious instruction/prompt-injection phrases.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sample_strategy",
+        type=str,
+        default="reservoir",
+        choices=("first", "reservoir"),
+        help=(
+            "With --max_examples, reservoir scans all shards and writes a random "
+            "subset. first stops after the first eligible examples."
+        ),
+    )
     parser.add_argument("--shuffle_files", action="store_true")
     parser.add_argument("--shuffle_within_shard", action="store_true")
     parser.add_argument("--log_every", type=int, default=10000)

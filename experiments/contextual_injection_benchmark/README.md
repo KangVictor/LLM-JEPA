@@ -30,6 +30,8 @@ python experiments/contextual_injection_benchmark/make_clean_corpus_from_shards.
   --max_examples 10000
 ```
 
+With `--max_examples`, the default `--sample_strategy reservoir` scans all matching shards and writes a random subset. This avoids taking only `train_000000.pt`, `train_000001.pt`, and so on. If you want the old fast sequential behavior, pass `--sample_strategy first`.
+
 For a final sharded dataset this reads `train_shards/train_*.pt` by default. For source shards created before final combine, use:
 
 ```bash
