@@ -43,6 +43,8 @@ masking:
   mask_ratio_max: 0.40
   max_mask_count: 4
   multi_mask: true        # ablation: true vs false
+  combinations_per_sample: 1  # >1 samples multiple mask sets per paragraph
+  val_combinations_per_sample: 1
 
 # SIGReg regularization
 sigreg:

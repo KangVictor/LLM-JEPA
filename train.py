@@ -128,7 +128,61 @@ def load_checkpoint(path, model, optimizer, scheduler, device):
     return resume_step
 
 
-def compute_losses(model, batch, cfg, sigreg, amp_dtype, use_amp):
+def compute_masked_prediction(
+    model,
+    input_ids,
+    attention_mask,
+    sentence_mask,
+    cfg,
+    combinations=None,
+):
+    """Encode once, then predict one or more mask combinations per paragraph."""
+    mask_cfg = cfg["masking"]
+    if combinations is None:
+        combinations = int(mask_cfg.get("combinations_per_sample", 1))
+    else:
+        combinations = int(combinations)
+    if combinations < 1:
+        raise ValueError("Mask combinations per sample must be at least 1")
+
+    enc_out = model.encoder(input_ids, attention_mask)  # (B, S, D)
+
+    mask_indices_list = []
+    mask_counts_list = []
+    for _ in range(combinations):
+        mask_indices, mask_counts = sample_masks(sentence_mask, mask_cfg)
+        mask_indices_list.append(mask_indices)
+        mask_counts_list.append(mask_counts)
+
+    if combinations == 1:
+        pred_out = model.predictor(enc_out, sentence_mask, mask_indices_list[0])
+        targets = enc_out[mask_indices_list[0]]
+        return pred_out, targets, enc_out, mask_counts_list[0]
+
+    mask_indices = torch.cat(mask_indices_list, dim=0)
+    mask_counts = torch.cat(mask_counts_list, dim=0)
+    if mask_indices.sum() == 0:
+        return None
+
+    # Repeat only sentence-level embeddings for predictor augmentation. This
+    # avoids re-running the token encoder for each sampled masking combination.
+    pred_enc_out = enc_out.repeat(combinations, 1, 1)
+    pred_sentence_mask = sentence_mask.repeat(combinations, 1)
+    pred_out = model.predictor(pred_enc_out, pred_sentence_mask, mask_indices)
+    targets = pred_enc_out[mask_indices]
+
+    return pred_out, targets, enc_out, mask_counts
+
+
+def compute_losses(
+    model,
+    batch,
+    cfg,
+    sigreg,
+    amp_dtype,
+    use_amp,
+    mask_combinations=None,
+):
     """Run one batch and compute prediction + SIGReg losses."""
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
@@ -154,16 +208,17 @@ def compute_losses(model, batch, cfg, sigreg, amp_dtype, use_amp):
             )
             mask_counts = pred_mask.sum(dim=1)
         elif mode == "masked":
-            mask_indices, mask_counts = sample_masks(sentence_mask, cfg["masking"])
-            if mask_indices.sum() == 0:
-                return None
-            pred_out, targets, enc_out, _ = model(
+            masked_result = compute_masked_prediction(
+                model,
                 input_ids,
                 attention_mask,
                 sentence_mask,
-                mask_indices=mask_indices,
-                mode="masked",
+                cfg,
+                combinations=mask_combinations,
             )
+            if masked_result is None:
+                return None
+            pred_out, targets, enc_out, mask_counts = masked_result
         else:
             raise ValueError(f"Unknown objective mode: {mode}")
 
@@ -207,6 +262,7 @@ def validate(model, val_loader, cfg, device, amp_dtype, use_amp, sigreg=None):
             sigreg,
             amp_dtype,
             use_amp,
+            mask_combinations=cfg["masking"].get("val_combinations_per_sample", 1),
         )
         if result is None:
             continue
@@ -374,10 +430,26 @@ def main():
     print(f"Batch size: {batch_size}, Precision: {train_cfg['precision']}")
     mode = cfg.get("objective", {}).get("mode", "next_sentence")
     print(f"Objective: {mode}")
+    mask_combinations = int(cfg["masking"].get("combinations_per_sample", 1))
+    val_mask_combinations = int(
+        cfg["masking"].get("val_combinations_per_sample", 1)
+    )
     print(
         f"SIGReg: {sig_cfg['enabled']}, SIGReg Lambda: {sig_cfg['weight']} "
         f"Multi-mask: {cfg['masking']['multi_mask']}"
     )
+    if mode == "masked":
+        effective_views = num_train * mask_combinations
+        print(
+            f"Mask combinations per paragraph: {mask_combinations} "
+            f"(effective masked views/epoch: {effective_views:,})"
+        )
+        print(f"Validation mask combinations per paragraph: {val_mask_combinations}")
+    elif mask_combinations != 1:
+        print(
+            "Mask combinations per paragraph is ignored because "
+            f"objective.mode={mode!r}."
+        )
     print(f"Predictor layers: {cfg['predictor']['num_layers']}")
     print(
         f"Mask ratio: "
@@ -408,6 +480,7 @@ def main():
                 sigreg,
                 amp_dtype,
                 use_amp,
+                mask_combinations=mask_combinations,
             )
             if result is None:
                 continue
