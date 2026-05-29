@@ -1,0 +1,85 @@
+# Fine-tune an existing Hugging Face encoder with the SentenceJEPA objective.
+
+pretrained_encoder:
+  model_name_or_path: "bert-base-uncased"
+  tokenizer_name: null
+  pooling: "mean"              # mean, cls, or pooler
+  projector_hidden_size: 2048
+  encoder_lr: 2.0e-5           # pretrained backbone LR
+  head_lr: 1.0e-4              # projector + predictor LR
+  freeze_base: false
+  freeze_embeddings: false
+  freeze_layers: 0
+  gradient_checkpointing: false
+  normalize_output: false
+  trust_remote_code: false
+
+# Only embedding_size and projector_hidden_size are used by this script's
+# pretrained encoder. The rest is kept for compatibility with existing helpers.
+encoder:
+  embedding_size: 256
+  projector_hidden_size: 2048
+  max_seq_len: 48
+  hidden_size: 256
+  num_layers: 4
+  num_heads: 4
+  ffn_size: 1024
+  vocab_size: 30522
+  dropout: 0.1
+
+predictor:
+  num_layers: 6
+  hidden_size: 256
+  num_heads: 4
+  ffn_size: 2048
+  projector_hidden_size: 2048
+  dropout: 0.1
+
+objective:
+  mode: "masked"  # masked is usually the useful JEPA fine-tuning objective
+
+data:
+  dataset: "wikimedia/wikipedia"
+  config: "20231101.en"
+  local_path: null
+  preprocessed_path: null
+  streaming: true
+  min_sentences: 4
+  max_sentences: 12
+  max_tokens_per_sentence: 48
+  tokenizer: "bert-base-uncased"
+  num_workers: 4
+
+masking:
+  mask_ratio_min: 0.25
+  mask_ratio_max: 0.40
+  max_mask_count: 4
+  multi_mask: true
+  combinations_per_sample: 1
+  val_combinations_per_sample: 1
+
+sigreg:
+  enabled: true
+  knots: 17
+  num_projections: 1024
+  weight: 0.03
+
+training:
+  batch_size: 64
+  lr: 1.0e-4
+  weight_decay: 1.0e-3
+  warmup_steps: 1000
+  epochs: 3
+  precision: "bf16"
+  grad_clip: 1.0
+  val_paragraphs: 1000
+  val_every: 500
+  log_every: 50
+  save_every: 1000
+  checkpoint_dir: "checkpoints_pretrained_jepa"
+  resume_from: null
+  seed: 42
+
+wandb:
+  project: "sentence-jepa-pretrained"
+  enabled: true
