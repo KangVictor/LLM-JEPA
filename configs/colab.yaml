@@ -11,6 +11,16 @@ encoder:
   max_seq_len: 48
   vocab_size: 30522  # BERT tokenizer vocab
   dropout: 0.1
+  freeze: false
+
+# Paragraph-level transformer over sentence embeddings
+document:
+  num_layers: 2
+  hidden_size: 256
+  num_heads: 4
+  ffn_size: 1024
+  dropout: 0.1
+  max_sentences: 20
 
 # Sentence-level predictor
 predictor:
@@ -23,7 +33,8 @@ predictor:
 
 # JEPA objective
 objective:
-  mode: "next_sentence"  # next_sentence or masked
+  mode: "masked"
+  detach_target: false
 
 # Data pipeline
 data:
@@ -43,12 +54,21 @@ masking:
   mask_ratio_max: 0.40
   max_mask_count: 4
   multi_mask: true        # ablation: true vs false
+  span_masking: true
+  span_len_min: 1
+  span_len_max: 3
+  num_spans_min: 1
+  num_spans_max: 2
+  keep_at_least_one_visible: true
   combinations_per_sample: 1  # >1 samples multiple mask sets per paragraph
   val_combinations_per_sample: 1
 
 # SIGReg regularization
 sigreg:
   enabled: true           # ablation: true vs false
+  document_enabled: false
+  contextual_enabled: true
+  contextual_weight: 1.0
   knots: 17
   num_projections: 1024
   weight: 0.09

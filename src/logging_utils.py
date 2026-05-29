@@ -92,6 +92,10 @@ def log_step(step, losses, metrics, mask_counts, wandb_run):
         "loss/prediction": losses["prediction"],
         "loss/sigreg": losses["sigreg"],
     }
+    if "sigreg_document" in losses:
+        log_dict["loss/sigreg_document"] = losses["sigreg_document"]
+    if "sigreg_contextual" in losses:
+        log_dict["loss/sigreg_contextual"] = losses["sigreg_contextual"]
     log_dict.update(metrics)
 
     # Mask count distribution

@@ -10,6 +10,12 @@ Usage:
         --task Banking77Classification \
         --batch_size 128
 
+    # Old independent sentence-mean behavior:
+    python eval_mteb.py --config configs/default.yaml \
+        --checkpoint checkpoints/step_50000.pt \
+        --task AskUbuntuDupQuestions \
+        --embedding_mode sentence_mean
+
     # Old single-sequence behavior:
     python eval_mteb.py --config configs/default.yaml \
         --checkpoint checkpoints/step_50000.pt \
@@ -33,7 +39,7 @@ import yaml
 from transformers import AutoTokenizer
 
 from src.data import split_sentences
-from src.model import SentenceEncoder
+from src.model import SentenceJEPA
 
 
 def get_embedding_dim(cfg):
@@ -64,7 +70,7 @@ def autocast_context(device, enabled, dtype):
 
 
 class SentenceJEPAWrapper:
-    """Wraps the SentenceEncoder for MTEB evaluation, implementing EncoderProtocol."""
+    """Wraps SentenceJEPA for MTEB evaluation, implementing EncoderProtocol."""
 
     def __init__(
         self,
@@ -72,7 +78,7 @@ class SentenceJEPAWrapper:
         checkpoint_path,
         device="cuda",
         batch_size=64,
-        embedding_mode="sentence_mean",
+        embedding_mode="document",
         max_sentences_per_text=None,
         precision="auto",
     ):
@@ -90,19 +96,33 @@ class SentenceJEPAWrapper:
             str(Path(checkpoint_path).resolve()).encode("utf-8")
         ).hexdigest()[:8]
 
-        # Load encoder
-        self.encoder = SentenceEncoder(cfg).to(self.device)
+        # Load full hierarchical encoder. The predictor is present in the
+        # checkpoint but is not used by encode_document during inference.
+        self.model = SentenceJEPA(cfg).to(self.device)
 
-        # Extract encoder weights from full SentenceJEPA checkpoint
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         state_dict = ckpt["model_state_dict"]
-        encoder_state = {
-            k.removeprefix("encoder."): v
-            for k, v in state_dict.items()
-            if k.startswith("encoder.")
-        }
-        self.encoder.load_state_dict(encoder_state)
-        self.encoder.eval()
+        has_document_weights = any(
+            key.startswith("document_transformer.") for key in state_dict
+        )
+        if self.embedding_mode == "document" and not has_document_weights:
+            raise ValueError(
+                "embedding_mode='document' requires a hierarchical Paragraph-JEPA "
+                "checkpoint with document_transformer weights. Use "
+                "--embedding_mode sentence_mean for older checkpoints."
+            )
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(
+                "Warning: checkpoint is missing hierarchical model keys; "
+                f"first missing keys: {missing[:5]}"
+            )
+        if unexpected:
+            print(
+                "Warning: checkpoint has unexpected keys; "
+                f"first unexpected keys: {unexpected[:5]}"
+            )
+        self.model.eval()
 
         # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -153,13 +173,26 @@ class SentenceJEPAWrapper:
 
         input_ids = encoded["input_ids"].unsqueeze(1).to(self.device)
         attention_mask = encoded["attention_mask"].unsqueeze(1).to(self.device)
+        sentence_mask = torch.ones(
+            input_ids.shape[:2],
+            dtype=torch.bool,
+            device=self.device,
+        )
 
         with autocast_context(self.device, self.use_amp, self.amp_dtype):
-            emb = self.encoder(input_ids, attention_mask)  # (B, 1, D)
+            if self.embedding_mode == "document":
+                emb = self.model.encode_document(
+                    input_ids,
+                    attention_mask,
+                    sentence_mask,
+                    normalize=True,
+                )
+            else:
+                emb = self.model.encoder(input_ids, attention_mask).squeeze(1)
 
-        return emb.squeeze(1)
+        return emb
 
-    def encode_sentence_mean_batch(self, texts):
+    def encode_sentence_mean_batch(self, texts, contextual=False):
         sentence_lists = [self.text_to_sentences(text) for text in texts]
         flat_sentences = [
             sentence
@@ -198,9 +231,17 @@ class SentenceJEPAWrapper:
         sentence_mask = sentence_mask.to(self.device)
 
         with autocast_context(self.device, self.use_amp, self.amp_dtype):
-            sent_embs = self.encoder(input_ids, attention_mask)  # (B, S, D)
-            weights = sentence_mask.unsqueeze(-1).to(dtype=sent_embs.dtype)
-            emb = (sent_embs * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
+            if contextual:
+                emb = self.model.encode_document(
+                    input_ids,
+                    attention_mask,
+                    sentence_mask,
+                    normalize=True,
+                )
+            else:
+                sent_embs = self.model.encoder(input_ids, attention_mask)  # (B, S, D)
+                weights = sentence_mask.unsqueeze(-1).to(dtype=sent_embs.dtype)
+                emb = (sent_embs * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
 
         return emb
 
@@ -240,6 +281,8 @@ class SentenceJEPAWrapper:
 
                 if self.embedding_mode == "single":
                     emb = self.encode_single_batch(texts)
+                elif self.embedding_mode == "document":
+                    emb = self.encode_sentence_mean_batch(texts, contextual=True)
                 elif self.embedding_mode == "sentence_mean":
                     emb = self.encode_sentence_mean_batch(texts)
                 else:
@@ -276,11 +319,12 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
         "--embedding_mode",
-        choices=["single", "sentence_mean"],
-        default="sentence_mean",
+        choices=["document", "single", "sentence_mean"],
+        default="document",
         help=(
-            "sentence_mean: split each text into sentences and mean-pool sentence "
-            "embeddings. single: old first-max_seq_len-token behavior."
+            "document: split text into sentences, contextualize them with the "
+            "document transformer, then normalized mean-pool. sentence_mean: old "
+            "independent sentence mean. single: old first-max_seq_len-token behavior."
         ),
     )
     parser.add_argument(

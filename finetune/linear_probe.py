@@ -42,7 +42,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoTokenizer
 
 from src.data import split_sentences
-from src.model import SentenceEncoder
+from src.model import SentenceEncoder, SentenceJEPA
 
 
 def is_int_like(value):
@@ -70,17 +70,20 @@ def autocast_context(device):
 
 
 def load_encoder(cfg, checkpoint_path, device):
-    """Load frozen SentenceEncoder from a SentenceJEPA checkpoint."""
-    encoder = SentenceEncoder(cfg).to(device)
-
+    """Load a frozen embedding model from a SentenceJEPA checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = ckpt["model_state_dict"]
-    encoder_state = {
-        k.removeprefix("encoder."): v
-        for k, v in state_dict.items()
-        if k.startswith("encoder.")
-    }
-    encoder.load_state_dict(encoder_state)
+    if any(k.startswith("document_transformer.") for k in state_dict):
+        encoder = SentenceJEPA(cfg).to(device)
+        encoder.load_state_dict(state_dict, strict=False)
+    else:
+        encoder = SentenceEncoder(cfg).to(device)
+        encoder_state = {
+            k.removeprefix("encoder."): v
+            for k, v in state_dict.items()
+            if k.startswith("encoder.")
+        }
+        encoder.load_state_dict(encoder_state)
     encoder.eval()
 
     # Freeze all parameters
@@ -111,7 +114,8 @@ def encode_texts_single(encoder, tokenizer, texts, max_length, device, batch_siz
         attention_mask = encoded["attention_mask"].unsqueeze(1).to(device)
 
         with autocast_context(device):
-            emb = encoder(input_ids, attention_mask)  # (B, 1, D)
+            sentence_encoder = getattr(encoder, "encoder", encoder)
+            emb = sentence_encoder(input_ids, attention_mask)  # (B, 1, D)
 
         all_embeddings.append(emb.squeeze(1).float().cpu())
 
@@ -138,6 +142,7 @@ def encode_texts_sentence_mean(
     device,
     batch_size=64,
     max_sentences=None,
+    contextual=False,
 ):
     """Encode split sentences and mean-pool sentence embeddings per example."""
     all_embeddings = []
@@ -185,9 +190,23 @@ def encode_texts_sentence_mean(
         sentence_mask = sentence_mask.to(device)
 
         with autocast_context(device):
-            sent_embs = encoder(input_ids, attention_mask)  # (B, S, D)
-            weights = sentence_mask.unsqueeze(-1).to(dtype=sent_embs.dtype)
-            emb = (sent_embs * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
+            if contextual:
+                if not hasattr(encoder, "encode_document"):
+                    raise ValueError(
+                        "embedding_mode='document' requires a hierarchical "
+                        "SentenceJEPA checkpoint."
+                    )
+                emb = encoder.encode_document(
+                    input_ids,
+                    attention_mask,
+                    sentence_mask,
+                    normalize=True,
+                )
+            else:
+                sentence_encoder = getattr(encoder, "encoder", encoder)
+                sent_embs = sentence_encoder(input_ids, attention_mask)  # (B, S, D)
+                weights = sentence_mask.unsqueeze(-1).to(dtype=sent_embs.dtype)
+                emb = (sent_embs * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
 
         all_embeddings.append(emb.float().cpu())
 
@@ -218,6 +237,17 @@ def encode_texts(
             device,
             batch_size,
             max_sentences=max_sentences,
+        )
+    if embedding_mode == "document":
+        return encode_texts_sentence_mean(
+            encoder,
+            tokenizer,
+            texts,
+            max_length,
+            device,
+            batch_size,
+            max_sentences=max_sentences,
+            contextual=True,
         )
     raise ValueError(f"Unknown embedding mode: {embedding_mode}")
 
@@ -387,11 +417,11 @@ def main():
     )
     parser.add_argument(
         "--embedding_mode",
-        choices=["single", "sentence_mean"],
-        default="single",
+        choices=["document", "single", "sentence_mean"],
+        default="document",
         help=(
-            "single: current one-sequence probe. sentence_mean: split each "
-            "example into sentences, encode each sentence, then mean-pool."
+            "document: contextual sentence mean from hierarchical Paragraph-JEPA. "
+            "single: one-sequence probe. sentence_mean: independent sentence mean."
         ),
     )
     parser.add_argument(

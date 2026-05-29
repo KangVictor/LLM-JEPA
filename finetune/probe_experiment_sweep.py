@@ -58,7 +58,7 @@ from finetune.probe_sweep import (
     subset_examples,
     train_probe,
 )
-from src.model import SentenceEncoder
+from src.model import SentenceEncoder, SentenceJEPA
 
 
 PREFERRED_FIELDS = [
@@ -199,8 +199,12 @@ def load_encoder_and_config(fallback_cfg, checkpoint_path, device, use_checkpoin
     if not encoder_state:
         raise ValueError(f"No encoder.* weights found in {checkpoint_path}")
 
-    encoder = SentenceEncoder(cfg).to(device)
-    encoder.load_state_dict(encoder_state)
+    if any(key.startswith("document_transformer.") for key in state_dict):
+        encoder = SentenceJEPA(cfg).to(device)
+        encoder.load_state_dict(state_dict, strict=False)
+    else:
+        encoder = SentenceEncoder(cfg).to(device)
+        encoder.load_state_dict(encoder_state)
     encoder.eval()
     for param in encoder.parameters():
         param.requires_grad = False
@@ -427,7 +431,7 @@ def prepare_batches(
             batch_size,
             pin_memory,
         )
-    if embedding_mode == "sentence_mean":
+    if embedding_mode in ("sentence_mean", "document"):
         return prepare_sentence_mean_batches(
             texts,
             tokenizer,
@@ -528,15 +532,29 @@ def encode_prepared_batches(
             sentence_mask = batch["sentence_mask"].to(device, non_blocking=True)
 
             with autocast_context(device, amp_enabled, amp_dtype):
-                sent_embs = encoder(input_ids, attention_mask)
-                if embedding_mode == "single":
-                    emb = sent_embs.squeeze(1)
-                else:
-                    weights = sentence_mask.unsqueeze(-1).to(dtype=sent_embs.dtype)
-                    emb = (
-                        (sent_embs * weights).sum(dim=1)
-                        / weights.sum(dim=1).clamp(min=1)
+                if embedding_mode == "document":
+                    if not hasattr(encoder, "encode_document"):
+                        raise ValueError(
+                            "embedding_mode='document' requires a hierarchical "
+                            "SentenceJEPA checkpoint."
+                        )
+                    emb = encoder.encode_document(
+                        input_ids,
+                        attention_mask,
+                        sentence_mask,
+                        normalize=True,
                     )
+                else:
+                    sentence_encoder = getattr(encoder, "encoder", encoder)
+                    sent_embs = sentence_encoder(input_ids, attention_mask)
+                    if embedding_mode == "single":
+                        emb = sent_embs.squeeze(1)
+                    else:
+                        weights = sentence_mask.unsqueeze(-1).to(dtype=sent_embs.dtype)
+                        emb = (
+                            (sent_embs * weights).sum(dim=1)
+                            / weights.sum(dim=1).clamp(min=1)
+                        )
 
             embeddings.append(emb.float().cpu())
             if log_every and (
@@ -928,8 +946,8 @@ def main():
     )
     parser.add_argument(
         "--embedding_mode",
-        choices=["single", "sentence_mean"],
-        default="single",
+        choices=["document", "single", "sentence_mean"],
+        default="document",
     )
     parser.add_argument(
         "--max_sentences_per_text",

@@ -450,7 +450,15 @@ def main():
             )
             if result is None:
                 continue
-            loss_total, loss_pred, loss_sig, enc_out, mask_counts = result
+            (
+                loss_total,
+                loss_pred,
+                loss_sig,
+                metric_out,
+                metric_mask,
+                mask_counts,
+                sig_losses,
+            ) = result
 
             optimizer.zero_grad(set_to_none=True)
             loss_total.backward()
@@ -464,8 +472,10 @@ def main():
                     "total": loss_total.item(),
                     "prediction": loss_pred.item(),
                     "sigreg": loss_sig.item() if torch.is_tensor(loss_sig) else loss_sig,
+                    "sigreg_document": sig_losses["document"].item(),
+                    "sigreg_contextual": sig_losses["contextual"].item(),
                 }
-                metrics = compute_metrics(enc_out.detach(), sentence_mask)
+                metrics = compute_metrics(metric_out.detach(), metric_mask)
                 log_step(step, losses, metrics, mask_counts, wandb_run)
 
             if step > 0 and step % train_cfg["val_every"] == 0:

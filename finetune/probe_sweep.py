@@ -38,7 +38,7 @@ from finetune.linear_probe import (
     get_embedding_dim,
     load_mteb_classification_data,
 )
-from src.model import SentenceEncoder
+from src.model import SentenceEncoder, SentenceJEPA
 
 
 def checkpoint_step_from_name(path):
@@ -97,17 +97,21 @@ def normalize_step(step):
 
 
 def load_encoder_and_step(cfg, checkpoint_path, device):
-    """Load only the frozen encoder weights from a SentenceJEPA checkpoint."""
+    """Load a frozen embedding model from a SentenceJEPA checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt["model_state_dict"]
-    encoder_state = {
-        k.removeprefix("encoder."): v
-        for k, v in state_dict.items()
-        if k.startswith("encoder.")
-    }
 
-    encoder = SentenceEncoder(cfg).to(device)
-    encoder.load_state_dict(encoder_state)
+    if any(k.startswith("document_transformer.") for k in state_dict):
+        encoder = SentenceJEPA(cfg).to(device)
+        encoder.load_state_dict(state_dict, strict=False)
+    else:
+        encoder_state = {
+            k.removeprefix("encoder."): v
+            for k, v in state_dict.items()
+            if k.startswith("encoder.")
+        }
+        encoder = SentenceEncoder(cfg).to(device)
+        encoder.load_state_dict(encoder_state)
     encoder.eval()
     for param in encoder.parameters():
         param.requires_grad = False
@@ -401,11 +405,11 @@ def main():
     )
     parser.add_argument(
         "--embedding_mode",
-        choices=["single", "sentence_mean"],
-        default="single",
+        choices=["document", "single", "sentence_mean"],
+        default="document",
         help=(
-            "single: current one-sequence probe. sentence_mean: split each "
-            "example into sentences, encode each sentence, then mean-pool."
+            "document: contextual sentence mean from hierarchical Paragraph-JEPA. "
+            "single: one-sequence probe. sentence_mean: independent sentence mean."
         ),
     )
     parser.add_argument(

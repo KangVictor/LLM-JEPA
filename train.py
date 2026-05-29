@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from src.data import WikiParagraphDataset, collate_fn, summarize_dataset, load_preprocessed
 from src.logging_utils import compute_metrics, log_step, log_val
 from src.masking import sample_masks
-from src.model import SentenceJEPA
+from src.model import SentenceJEPA, masked_mean_pool
 from src.sigreg import SIGReg
 
 
@@ -145,33 +145,61 @@ def compute_masked_prediction(
     if combinations < 1:
         raise ValueError("Mask combinations per sample must be at least 1")
 
-    enc_out = model.encoder(input_ids, attention_mask)  # (B, S, D)
+    if not hasattr(model, "document_transformer"):
+        enc_out = model.encoder(input_ids, attention_mask)  # (B, S, D)
 
-    mask_indices_list = []
+        mask_indices_list = []
+        mask_counts_list = []
+        for _ in range(combinations):
+            mask_indices, mask_counts = sample_masks(sentence_mask, mask_cfg)
+            mask_indices_list.append(mask_indices)
+            mask_counts_list.append(mask_counts)
+
+        if combinations == 1:
+            pred_out = model.predictor(enc_out, sentence_mask, mask_indices_list[0])
+            targets = enc_out[mask_indices_list[0]]
+            return pred_out, targets, enc_out, None, mask_counts_list[0]
+
+        mask_indices = torch.cat(mask_indices_list, dim=0)
+        mask_counts = torch.cat(mask_counts_list, dim=0)
+        if mask_indices.sum() == 0:
+            return None
+
+        pred_enc_out = enc_out.repeat(combinations, 1, 1)
+        pred_sentence_mask = sentence_mask.repeat(combinations, 1)
+        pred_out = model.predictor(pred_enc_out, pred_sentence_mask, mask_indices)
+        targets = pred_enc_out[mask_indices]
+        return pred_out, targets, enc_out, None, mask_counts
+
+    sentence_embeddings = model.encoder(input_ids, attention_mask)  # (B, S, D)
+    target_contextual = model.document_transformer(sentence_embeddings, sentence_mask)
+    doc_embeddings = masked_mean_pool(target_contextual, sentence_mask, normalize=False)
+
+    pred_out_list = []
+    targets_list = []
     mask_counts_list = []
     for _ in range(combinations):
         mask_indices, mask_counts = sample_masks(sentence_mask, mask_cfg)
-        mask_indices_list.append(mask_indices)
         mask_counts_list.append(mask_counts)
+        if mask_indices.sum() == 0:
+            continue
+        pred_out, targets, _, _, _ = model.forward_masked_from_sentence_embeddings(
+            sentence_embeddings,
+            sentence_mask,
+            mask_indices,
+            target_contextual=target_contextual,
+        )
+        pred_out_list.append(pred_out)
+        targets_list.append(targets)
 
-    if combinations == 1:
-        pred_out = model.predictor(enc_out, sentence_mask, mask_indices_list[0])
-        targets = enc_out[mask_indices_list[0]]
-        return pred_out, targets, enc_out, mask_counts_list[0]
-
-    mask_indices = torch.cat(mask_indices_list, dim=0)
-    mask_counts = torch.cat(mask_counts_list, dim=0)
-    if mask_indices.sum() == 0:
+    if not pred_out_list:
         return None
 
-    # Repeat only sentence-level embeddings for predictor augmentation. This
-    # avoids re-running the token encoder for each sampled masking combination.
-    pred_enc_out = enc_out.repeat(combinations, 1, 1)
-    pred_sentence_mask = sentence_mask.repeat(combinations, 1)
-    pred_out = model.predictor(pred_enc_out, pred_sentence_mask, mask_indices)
-    targets = pred_enc_out[mask_indices]
+    pred_out = torch.cat(pred_out_list, dim=0)
+    targets = torch.cat(targets_list, dim=0)
+    mask_counts = torch.cat(mask_counts_list, dim=0)
 
-    return pred_out, targets, enc_out, mask_counts
+    return pred_out, targets, target_contextual, doc_embeddings, mask_counts
 
 
 def compute_losses(
@@ -200,12 +228,18 @@ def compute_losses(
 
     with autocast_ctx:
         if mode == "next_sentence":
-            pred_out, targets, enc_out, pred_mask = model(
+            if hasattr(model, "document_transformer"):
+                raise NotImplementedError(
+                    "next_sentence is not implemented for hierarchical Paragraph-JEPA. "
+                    "Use objective.mode='masked'."
+                )
+            pred_out, targets, model_out, pred_mask = model(
                 input_ids,
                 attention_mask,
                 sentence_mask,
                 mode="next_sentence",
             )
+            doc_embeddings = None
             mask_counts = pred_mask.sum(dim=1)
         elif mode == "masked":
             masked_result = compute_masked_prediction(
@@ -218,7 +252,7 @@ def compute_losses(
             )
             if masked_result is None:
                 return None
-            pred_out, targets, enc_out, mask_counts = masked_result
+            pred_out, targets, model_out, doc_embeddings, mask_counts = masked_result
         else:
             raise ValueError(f"Unknown objective mode: {mode}")
 
@@ -228,14 +262,37 @@ def compute_losses(
         loss_pred = F.mse_loss(pred_out, targets)
 
         if sigreg is not None:
-            sigreg_embs = enc_out[sentence_mask]  # (N_valid_sentences, D)
-            loss_sig = sigreg(sigreg_embs)
+            sig_cfg = cfg["sigreg"]
+            loss_ref = model_out
+            loss_sig_doc = loss_ref.new_tensor(0.0)
+            loss_sig_contextual = loss_ref.new_tensor(0.0)
+            if doc_embeddings is None:
+                loss_sig_doc = sigreg(model_out[sentence_mask])
+            else:
+                if sig_cfg.get("document_enabled", False):
+                    loss_sig_doc = sigreg(doc_embeddings)
+                if sig_cfg.get("contextual_enabled", True):
+                    contextual_embs = model_out[sentence_mask]
+                    loss_sig_contextual = sigreg(contextual_embs)
+            loss_sig = (
+                loss_sig_doc
+                + sig_cfg.get("contextual_weight", 1.0) * loss_sig_contextual
+            )
             loss_total = loss_pred + cfg["sigreg"]["weight"] * loss_sig
         else:
-            loss_sig = enc_out.new_tensor(0.0)
+            loss_ref = model_out
+            loss_sig_doc = loss_ref.new_tensor(0.0)
+            loss_sig_contextual = loss_ref.new_tensor(0.0)
+            loss_sig = loss_ref.new_tensor(0.0)
             loss_total = loss_pred
 
-    return loss_total, loss_pred, loss_sig, enc_out, mask_counts
+    metric_out = model_out
+    metric_mask = sentence_mask
+    sig_losses = {
+        "document": loss_sig_doc,
+        "contextual": loss_sig_contextual,
+    }
+    return loss_total, loss_pred, loss_sig, metric_out, metric_mask, mask_counts, sig_losses
 
 
 @torch.no_grad()
@@ -266,17 +323,17 @@ def validate(model, val_loader, cfg, device, amp_dtype, use_amp, sigreg=None):
         )
         if result is None:
             continue
-        loss_total, loss_pred, loss_sig, enc_out, _ = result
+        loss_total, loss_pred, loss_sig, metric_out, metric_mask, _, _ = result
 
         total_pred += loss_pred.item()
         total_sig += loss_sig.item()
         total_loss += loss_total.item()
         num_batches += 1
         if len(metric_embs) < 4:
-            metric_embs.append(enc_out[sentence_mask].detach())
+            metric_embs.append(metric_out[metric_mask].detach())
         else:
             metric_embs.pop(0)
-            metric_embs.append(enc_out[sentence_mask].detach())
+            metric_embs.append(metric_out[metric_mask].detach())
 
     model.train()
 
@@ -291,13 +348,13 @@ def validate(model, val_loader, cfg, device, amp_dtype, use_amp, sigreg=None):
     # Metrics from last few batches (cap memory usage). Validation batches can
     # have different sentence counts, so concatenate flattened valid embeddings.
     embs_cat = torch.cat(metric_embs, dim=0)
-    enc_cat = embs_cat.unsqueeze(1)
-    smask_cat = torch.ones(
-        enc_cat.shape[:2],
+    metric_cat = embs_cat.unsqueeze(1)
+    metric_mask_cat = torch.ones(
+        metric_cat.shape[:2],
         dtype=torch.bool,
-        device=enc_cat.device,
+        device=metric_cat.device,
     )
-    metrics = compute_metrics(enc_cat, smask_cat)
+    metrics = compute_metrics(metric_cat, metric_mask_cat)
 
     return losses, metrics
 
@@ -436,7 +493,9 @@ def main():
     )
     print(
         f"SIGReg: {sig_cfg['enabled']}, SIGReg Lambda: {sig_cfg['weight']} "
-        f"Multi-mask: {cfg['masking']['multi_mask']}"
+        f"Multi-mask: {cfg['masking']['multi_mask']} "
+        f"Doc-SIGReg: {sig_cfg.get('document_enabled', False)} "
+        f"Contextual-SIGReg: {sig_cfg.get('contextual_enabled', True)}"
     )
     if mode == "masked":
         effective_views = num_train * mask_combinations
@@ -451,6 +510,13 @@ def main():
             f"objective.mode={mode!r}."
         )
     print(f"Predictor layers: {cfg['predictor']['num_layers']}")
+    if "document" in cfg:
+        print(
+            f"Document transformer layers: {cfg['document']['num_layers']} "
+            f"heads: {cfg['document']['num_heads']}"
+        )
+    print(f"Detach target: {cfg.get('objective', {}).get('detach_target', False)}")
+    print(f"Freeze sentence encoder: {cfg['encoder'].get('freeze', False)}")
     print(
         f"Mask ratio: "
         f"[{cfg['masking']['mask_ratio_min']}, {cfg['masking']['mask_ratio_max']}]"
@@ -484,7 +550,15 @@ def main():
             )
             if result is None:
                 continue
-            loss_total, loss_pred, loss_sig, enc_out, mask_counts = result
+            (
+                loss_total,
+                loss_pred,
+                loss_sig,
+                metric_out,
+                metric_mask,
+                mask_counts,
+                sig_losses,
+            ) = result
 
             # Backward
             optimizer.zero_grad(set_to_none=True)
@@ -500,8 +574,10 @@ def main():
                     "total": loss_total.item(),
                     "prediction": loss_pred.item(),
                     "sigreg": loss_sig.item() if torch.is_tensor(loss_sig) else loss_sig,
+                    "sigreg_document": sig_losses["document"].item(),
+                    "sigreg_contextual": sig_losses["contextual"].item(),
                 }
-                metrics = compute_metrics(enc_out.detach(), sentence_mask)
+                metrics = compute_metrics(metric_out.detach(), metric_mask)
                 log_step(step, losses, metrics, mask_counts, wandb_run)
 
             # Validation

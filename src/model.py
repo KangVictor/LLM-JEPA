@@ -1,5 +1,24 @@
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
+
+
+def masked_mean_pool(x, mask, normalize=False):
+    """Mean-pool valid sequence positions.
+
+    Args:
+        x: (B, S, D) tensor
+        mask: (B, S) bool tensor
+        normalize: whether to L2-normalize the pooled output
+
+    Returns:
+        pooled: (B, D)
+    """
+    weights = mask.unsqueeze(-1).to(dtype=x.dtype)
+    pooled = (x * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
+    if normalize:
+        pooled = F.normalize(pooled, dim=-1)
+    return pooled
 
 
 class ProjectionHead(nn.Module):
@@ -209,13 +228,289 @@ class Predictor(nn.Module):
         return predictions
 
 
-class SentenceJEPA(nn.Module):
-    """Full SentenceJEPA: encoder + predictor, end-to-end (no EMA, no stop-grad)."""
+class DocumentTransformer(nn.Module):
+    """Contextualizes sentence embeddings with paragraph-level self-attention."""
 
     def __init__(self, cfg):
         super().__init__()
+        enc = cfg["encoder"]
+        doc = cfg.get("document", {})
+        data = cfg["data"]
+
+        self.embedding_size = enc.get("embedding_size", enc["hidden_size"])
+        self.hidden_size = doc.get("hidden_size", self.embedding_size)
+        self.max_sentences = doc.get("max_sentences", data["max_sentences"])
+
+        self.input_proj = (
+            nn.Linear(self.embedding_size, self.hidden_size)
+            if self.embedding_size != self.hidden_size
+            else nn.Identity()
+        )
+        self.sentence_pos_emb = nn.Embedding(self.max_sentences, self.hidden_size)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_size,
+            nhead=doc.get("num_heads", enc["num_heads"]),
+            dim_feedforward=doc.get("ffn_size", enc.get("ffn_size", 1024)),
+            dropout=doc.get("dropout", enc.get("dropout", 0.1)),
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=doc.get("num_layers", 2)
+        )
+        self.norm = nn.LayerNorm(self.hidden_size)
+        self.output_proj = (
+            nn.Linear(self.hidden_size, self.embedding_size)
+            if self.hidden_size != self.embedding_size
+            else nn.Identity()
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.sentence_pos_emb.weight, std=0.02)
+        if isinstance(self.input_proj, nn.Linear):
+            nn.init.xavier_uniform_(self.input_proj.weight)
+            nn.init.zeros_(self.input_proj.bias)
+        if isinstance(self.output_proj, nn.Linear):
+            nn.init.xavier_uniform_(self.output_proj.weight)
+            nn.init.zeros_(self.output_proj.bias)
+        for p in self.transformer.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, sentence_embeddings, sentence_mask, position_ids=None):
+        """
+        Args:
+            sentence_embeddings: (B, S, D)
+            sentence_mask: (B, S) bool — True for sentences visible to the branch
+            position_ids: optional (B, S) original sentence positions
+
+        Returns:
+            contextual_sentence_embeddings: (B, S, D)
+        """
+        B, S, _ = sentence_embeddings.shape
+        if S > self.max_sentences:
+            raise ValueError(
+                f"DocumentTransformer saw {S} sentences but max_sentences="
+                f"{self.max_sentences}. Increase document.max_sentences or "
+                "data.max_sentences."
+            )
+
+        if position_ids is None:
+            position_ids = torch.arange(S, device=sentence_embeddings.device)
+            position_ids = position_ids.unsqueeze(0).expand(B, S)
+        else:
+            position_ids = position_ids.to(device=sentence_embeddings.device)
+        position_ids = position_ids.clamp(max=self.max_sentences - 1)
+
+        visible = sentence_mask.unsqueeze(-1).to(dtype=sentence_embeddings.dtype)
+        x = self.input_proj(sentence_embeddings * visible)
+        x = x + self.sentence_pos_emb(position_ids)
+
+        x = self.transformer(x, src_key_padding_mask=~sentence_mask)
+        x = self.norm(x)
+        x = self.output_proj(x)
+        return x * visible
+
+
+class ContextQueryPredictor(nn.Module):
+    """Predict target contextual sentence embeddings from visible context tokens."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        enc = cfg["encoder"]
+        pred = cfg["predictor"]
+        data = cfg["data"]
+        doc = cfg.get("document", {})
+
+        self.embedding_size = enc.get("embedding_size", enc["hidden_size"])
+        self.hidden_size = pred["hidden_size"]
+        self.max_sentences = doc.get("max_sentences", data["max_sentences"])
+
+        self.input_proj = (
+            nn.Linear(self.embedding_size, self.hidden_size)
+            if self.embedding_size != self.hidden_size
+            else nn.Identity()
+        )
+        self.sentence_pos_emb = nn.Embedding(self.max_sentences, self.hidden_size)
+        self.target_query = nn.Parameter(torch.randn(self.hidden_size) * 0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_size,
+            nhead=pred["num_heads"],
+            dim_feedforward=pred["ffn_size"],
+            dropout=pred.get("dropout", 0.1),
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=pred["num_layers"]
+        )
+        self.norm = nn.LayerNorm(self.hidden_size)
+        self.pred_projector = ProjectionHead(
+            input_dim=self.hidden_size,
+            hidden_dim=pred.get("projector_hidden_size", 2048),
+            output_dim=self.embedding_size,
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.sentence_pos_emb.weight, std=0.02)
+        if isinstance(self.input_proj, nn.Linear):
+            nn.init.xavier_uniform_(self.input_proj.weight)
+            nn.init.zeros_(self.input_proj.bias)
+        for p in self.transformer.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, context_embeddings, visible_mask, target_mask, position_ids=None):
+        """
+        Args:
+            context_embeddings: (B, S, D) contextual visible sentence outputs
+            visible_mask: (B, S) bool — visible context sentence slots
+            target_mask: (B, S) bool — target query slots to predict
+            position_ids: optional (B, S) original sentence positions
+
+        Returns:
+            predictions: (N_targets, D)
+        """
+        B, S, _ = context_embeddings.shape
+        if S > self.max_sentences:
+            raise ValueError(
+                f"ContextQueryPredictor saw {S} sentences but max_sentences="
+                f"{self.max_sentences}. Increase document.max_sentences or "
+                "data.max_sentences."
+            )
+
+        if position_ids is None:
+            position_ids = torch.arange(S, device=context_embeddings.device)
+            position_ids = position_ids.unsqueeze(0).expand(B, S)
+        else:
+            position_ids = position_ids.to(device=context_embeddings.device)
+        position_ids = position_ids.clamp(max=self.max_sentences - 1)
+
+        pos = self.sentence_pos_emb(position_ids)
+        context_tokens = self.input_proj(context_embeddings) + pos
+        query_tokens = self.target_query.view(1, 1, -1) + pos
+
+        x = torch.cat([context_tokens, query_tokens], dim=1)
+        token_mask = torch.cat([visible_mask, target_mask], dim=1)
+
+        x = self.transformer(x, src_key_padding_mask=~token_mask)
+        x = self.norm(x)
+
+        query_out = x[:, S:]
+        pred_all = self.pred_projector(query_out, target_mask)
+        return pred_all[target_mask]
+
+
+class SentenceJEPA(nn.Module):
+    """Hierarchical Paragraph-JEPA: sentence encoder + document transformer."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
         self.encoder = SentenceEncoder(cfg)
-        self.predictor = Predictor(cfg)
+        self.document_transformer = DocumentTransformer(cfg)
+        self.predictor = ContextQueryPredictor(cfg)
+        self.detach_target = cfg.get("objective", {}).get("detach_target", False)
+        self.freeze_sentence_encoder_flag = cfg["encoder"].get("freeze", False)
+
+        if self.freeze_sentence_encoder_flag:
+            self.set_sentence_encoder_trainable(False)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_sentence_encoder_flag:
+            self.encoder.eval()
+        return self
+
+    def set_sentence_encoder_trainable(self, trainable=True):
+        for p in self.encoder.parameters():
+            p.requires_grad = trainable
+        self.freeze_sentence_encoder_flag = not trainable
+        if not trainable:
+            self.encoder.eval()
+
+    def encode_contextual(
+        self,
+        input_ids,
+        attention_mask,
+        sentence_mask,
+        visible_mask=None,
+        position_ids=None,
+    ):
+        """Encode sentences, then contextualize them at paragraph level."""
+        sentence_embeddings = self.encoder(input_ids, attention_mask)
+        doc_mask = sentence_mask if visible_mask is None else visible_mask
+        contextual = self.document_transformer(
+            sentence_embeddings,
+            doc_mask,
+            position_ids=position_ids,
+        )
+        return contextual
+
+    def encode_document(
+        self,
+        input_ids,
+        attention_mask,
+        sentence_mask,
+        normalize=True,
+        return_contextual=False,
+    ):
+        """Inference path: contextualize all sentences and mean-pool."""
+        contextual = self.encode_contextual(input_ids, attention_mask, sentence_mask)
+        document_embeddings = masked_mean_pool(
+            contextual,
+            sentence_mask,
+            normalize=normalize,
+        )
+        if return_contextual:
+            return document_embeddings, contextual
+        return document_embeddings
+
+    def forward_masked_from_sentence_embeddings(
+        self,
+        sentence_embeddings,
+        sentence_mask,
+        mask_indices,
+        target_contextual=None,
+        position_ids=None,
+    ):
+        """Predict target contextual sentence embeddings for sampled masks."""
+        if target_contextual is None:
+            target_contextual = self.document_transformer(
+                sentence_embeddings,
+                sentence_mask,
+                position_ids=position_ids,
+            )
+
+        visible_mask = sentence_mask & ~mask_indices
+        context_contextual = self.document_transformer(
+            sentence_embeddings,
+            visible_mask,
+            position_ids=position_ids,
+        )
+        pred_out = self.predictor(
+            context_contextual,
+            visible_mask,
+            mask_indices,
+            position_ids=position_ids,
+        )
+
+        targets = target_contextual[mask_indices]
+        if self.detach_target:
+            targets = targets.detach()
+
+        document_embeddings = masked_mean_pool(
+            target_contextual,
+            sentence_mask,
+            normalize=False,
+        )
+        return pred_out, targets, target_contextual, document_embeddings, mask_indices
 
     def forward_masked(self, input_ids, attention_mask, sentence_mask, mask_indices):
         """
@@ -226,25 +521,22 @@ class SentenceJEPA(nn.Module):
             mask_indices: (B, S) — True for masked positions
         Returns:
             pred_out: (N_masked, D) predicted embeddings
-            targets: (N_masked, D) original encoder embeddings at masked positions
-            enc_out: (B, S, D) all encoder embeddings (for SIGReg)
+            targets: (N_masked, D) contextual target embeddings at masked positions
+            contextual: (B, S, D) full contextual sentence embeddings
+            document_embeddings: (B, D) mean-pooled contextual document embeddings
         """
-        enc_out = self.encoder(input_ids, attention_mask)  # (B, S, D)
-        pred_out = self.predictor(enc_out, sentence_mask, mask_indices)
-        targets = enc_out[mask_indices]
-
-        return pred_out, targets, enc_out, mask_indices
+        sentence_embeddings = self.encoder(input_ids, attention_mask)
+        return self.forward_masked_from_sentence_embeddings(
+            sentence_embeddings,
+            sentence_mask,
+            mask_indices,
+        )
 
     def forward_next_sentence(self, input_ids, attention_mask, sentence_mask):
-        """Causal next-sentence JEPA objective in projected embedding space."""
-        enc_out = self.encoder(input_ids, attention_mask)  # (B, S, D)
-        pred_seq = self.predictor.forward_sequence(enc_out, sentence_mask, causal=True)
-        pair_mask = sentence_mask[:, :-1] & sentence_mask[:, 1:]
-
-        pred_out = pred_seq[:, :-1][pair_mask]
-        targets = enc_out[:, 1:][pair_mask]
-
-        return pred_out, targets, enc_out, pair_mask
+        raise NotImplementedError(
+            "next_sentence is not implemented for hierarchical Paragraph-JEPA. "
+            "Use objective.mode='masked'."
+        )
 
     def forward(
         self,
