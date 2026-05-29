@@ -20,6 +20,12 @@ Usage:
         --task AmazonPolarityClassification \
         --embedding_mode sentence_mean \
         --encode_batch_size 64
+
+    python -m finetune.linear_probe \
+        --config configs/default.yaml \
+        --checkpoint checkpoints/step_50000.pt \
+        --task TweetSentimentExtractionClassification \
+        --label_mode ordinal
 """
 
 import argparse
@@ -37,6 +43,17 @@ from transformers import AutoTokenizer
 
 from src.data import split_sentences
 from src.model import SentenceEncoder
+
+
+def is_int_like(value):
+    try:
+        return float(value).is_integer()
+    except (TypeError, ValueError):
+        return False
+
+
+def all_int_like(values):
+    return all(is_int_like(value) for value in values)
 
 
 def get_embedding_dim(cfg):
@@ -276,7 +293,9 @@ def load_mteb_classification_data(task_name):
     test_texts = test_split[text_col]
     test_labels_raw = test_split[label_col]
 
-    # Convert string labels to ints if needed
+    # Convert string labels to ints if needed. Numeric labels are kept numeric;
+    # integer-like labels receive class names, while non-integer labels can be
+    # used by scalar regression probes.
     if isinstance(train_labels_raw[0], str):
         label_names = sorted(set(train_labels_raw) | set(test_labels_raw))
         label_to_id = {name: i for i, name in enumerate(label_names)}
@@ -285,10 +304,56 @@ def load_mteb_classification_data(task_name):
     else:
         train_labels = list(train_labels_raw)
         test_labels = list(test_labels_raw)
-        num_classes = max(max(train_labels), max(test_labels)) + 1
-        label_names = [str(i) for i in range(num_classes)]
+        all_labels = train_labels + test_labels
+        if all_int_like(all_labels):
+            train_labels = [int(label) for label in train_labels]
+            test_labels = [int(label) for label in test_labels]
+            unique_labels = sorted(set(train_labels) | set(test_labels))
+            if unique_labels == list(range(len(unique_labels))):
+                label_names = [str(i) for i in unique_labels]
+            else:
+                label_names = [str(label) for label in unique_labels]
+        else:
+            train_labels = [float(label) for label in train_labels]
+            test_labels = [float(label) for label in test_labels]
+            label_names = []
 
     return train_texts, train_labels, test_texts, test_labels, label_names
+
+
+def resolve_label_mode(label_mode, train_labels, test_labels, label_names):
+    if label_mode != "auto":
+        return label_mode
+
+    labels = train_labels + test_labels
+    if label_names and all_int_like(labels):
+        return "classification"
+    return "regression"
+
+
+def scalar_probe_metrics(preds, labels, label_min=None, label_max=None):
+    preds = preds.float()
+    labels = labels.float()
+    mse = F.mse_loss(preds, labels).item()
+    mae = F.l1_loss(preds, labels).item()
+    metrics = {
+        "mse": mse,
+        "mae": mae,
+        "rmse": mse ** 0.5,
+    }
+    if label_min is not None and label_max is not None:
+        rounded = preds.round().clamp(label_min, label_max).long()
+        metrics["rounded_accuracy"] = (
+            rounded == labels.round().long()
+        ).float().mean().item()
+    return metrics
+
+
+def clone_state_dict(module):
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in module.state_dict().items()
+    }
 
 
 def main():
@@ -303,6 +368,23 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output", type=str, default="results/finetune")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--label_mode",
+        choices=["classification", "ordinal", "regression", "auto"],
+        default="classification",
+        help=(
+            "classification: linear classifier with cross-entropy. ordinal: "
+            "one-output scalar head for ordered integer labels. regression: "
+            "one-output scalar head for continuous labels. auto chooses "
+            "classification for integer-like class labels, regression otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--scalar_loss",
+        choices=["mse", "smooth_l1"],
+        default="mse",
+        help="Loss for ordinal/regression label modes.",
+    )
     parser.add_argument(
         "--embedding_mode",
         choices=["single", "sentence_mean"],
@@ -346,11 +428,31 @@ def main():
     print(f"\nLoading MTEB task: {args.task}")
     train_texts, train_labels, test_texts, test_labels, label_names = \
         load_mteb_classification_data(args.task)
+    label_mode = resolve_label_mode(
+        args.label_mode, train_labels, test_labels, label_names
+    )
+    scalar_mode = label_mode in ("ordinal", "regression")
+    if label_mode == "classification" and not label_names:
+        raise ValueError(
+            "Classification mode requires discrete integer/string labels. Use "
+            "--label_mode regression for continuous labels."
+        )
     num_classes = len(label_names)
+    all_labels = train_labels + test_labels
+    label_min = min(all_labels) if scalar_mode else None
+    label_max = max(all_labels) if scalar_mode else None
+    rounded_scalar_metrics = scalar_mode and all_int_like(all_labels)
 
     print(f"  Train: {len(train_texts):,} samples")
     print(f"  Test:  {len(test_texts):,} samples")
-    print(f"  Classes: {num_classes}")
+    print(f"  Label mode: {label_mode}")
+    if scalar_mode:
+        print(f"  Label range: [{label_min}, {label_max}]")
+        print(f"  Scalar loss: {args.scalar_loss}")
+        if rounded_scalar_metrics:
+            print("  Rounded scalar accuracy will be reported.")
+    else:
+        print(f"  Classes: {num_classes}")
     print(f"  Embedding mode: {args.embedding_mode}")
     if args.embedding_mode == "sentence_mean":
         print(f"  Max sentences/text: {max_sentences_per_text}")
@@ -412,8 +514,12 @@ def main():
     train_embs = F.normalize(train_embs, dim=1)
     test_embs = F.normalize(test_embs, dim=1)
 
-    train_labels_t = torch.tensor(train_labels, dtype=torch.long)
-    test_labels_t = torch.tensor(test_labels, dtype=torch.long)
+    if scalar_mode:
+        train_labels_t = torch.tensor(train_labels, dtype=torch.float32)
+        test_labels_t = torch.tensor(test_labels, dtype=torch.float32)
+    else:
+        train_labels_t = torch.tensor(train_labels, dtype=torch.long)
+        test_labels_t = torch.tensor(test_labels, dtype=torch.long)
 
     # Create data loaders (embeddings are on CPU, move per batch)
     train_ds = TensorDataset(train_embs, train_labels_t)
@@ -422,7 +528,8 @@ def main():
     test_loader = DataLoader(test_ds, batch_size=args.batch_size)
 
     # Linear probe
-    linear = nn.Linear(embedding_dim, num_classes).to(device)
+    output_dim = 1 if scalar_mode else num_classes
+    linear = nn.Linear(embedding_dim, output_dim).to(device)
     optimizer = torch.optim.AdamW(
         linear.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -432,57 +539,146 @@ def main():
     print(f"  lr={args.lr}, batch_size={args.batch_size}, weight_decay={args.weight_decay}")
 
     best_acc = 0.0
+    best_mae = float("inf")
+    best_rmse = float("inf")
+    best_rounded_acc = None
     best_epoch = 0
+    best_state = clone_state_dict(linear)
 
     for epoch in range(args.epochs):
         # Train
         linear.train()
         total_loss = 0.0
         total_correct = 0
+        total_abs_error = 0.0
+        total_sq_error = 0.0
+        total_rounded_correct = 0
         total_samples = 0
 
         for embs, labels in train_loader:
             embs, labels = embs.to(device), labels.to(device)
-            logits = linear(embs)
-            loss = F.cross_entropy(logits, labels)
+            outputs = linear(embs)
+            if scalar_mode:
+                preds = outputs.squeeze(-1)
+                if args.scalar_loss == "smooth_l1":
+                    loss = F.smooth_l1_loss(preds, labels)
+                else:
+                    loss = F.mse_loss(preds, labels)
+            else:
+                logits = outputs
+                loss = F.cross_entropy(logits, labels)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item() * embs.size(0)
-            total_correct += (logits.argmax(dim=1) == labels).sum().item()
+            if scalar_mode:
+                errors = preds.detach() - labels
+                total_abs_error += errors.abs().sum().item()
+                total_sq_error += errors.pow(2).sum().item()
+                if rounded_scalar_metrics:
+                    rounded = preds.detach().round().clamp(label_min, label_max).long()
+                    total_rounded_correct += (
+                        rounded == labels.round().long()
+                    ).sum().item()
+            else:
+                total_correct += (logits.argmax(dim=1) == labels).sum().item()
             total_samples += embs.size(0)
 
         scheduler.step()
-        train_acc = total_correct / total_samples
         train_loss = total_loss / total_samples
+        if scalar_mode:
+            train_mae = total_abs_error / total_samples
+            train_rmse = (total_sq_error / total_samples) ** 0.5
+            train_acc = (
+                total_rounded_correct / total_samples
+                if rounded_scalar_metrics
+                else None
+            )
+        else:
+            train_acc = total_correct / total_samples
+            train_mae = None
+            train_rmse = None
 
         # Evaluate
         linear.eval()
         test_correct = 0
         test_total = 0
+        test_preds = []
+        test_targets = []
 
         with torch.no_grad():
             for embs, labels in test_loader:
                 embs, labels = embs.to(device), labels.to(device)
-                logits = linear(embs)
-                test_correct += (logits.argmax(dim=1) == labels).sum().item()
+                outputs = linear(embs)
+                if scalar_mode:
+                    preds = outputs.squeeze(-1)
+                    test_preds.append(preds.cpu())
+                    test_targets.append(labels.cpu())
+                else:
+                    logits = outputs
+                    test_correct += (logits.argmax(dim=1) == labels).sum().item()
                 test_total += embs.size(0)
 
-        test_acc = test_correct / test_total
+        if scalar_mode:
+            test_preds_t = torch.cat(test_preds)
+            test_targets_t = torch.cat(test_targets)
+            test_metrics = scalar_probe_metrics(
+                test_preds_t,
+                test_targets_t,
+                label_min=label_min if rounded_scalar_metrics else None,
+                label_max=label_max if rounded_scalar_metrics else None,
+            )
+            test_mae = test_metrics["mae"]
+            test_rmse = test_metrics["rmse"]
+            test_acc = test_metrics.get("rounded_accuracy")
+            if label_mode == "ordinal" and test_acc is not None:
+                improved = test_acc > best_acc
+            else:
+                improved = test_mae < best_mae
+        else:
+            test_acc = test_correct / test_total
+            test_mae = None
+            test_rmse = None
+            improved = test_acc > best_acc
 
-        if test_acc > best_acc:
-            best_acc = test_acc
+        if improved:
+            if test_acc is not None:
+                best_acc = test_acc
+            if test_mae is not None:
+                best_mae = test_mae
+            if test_rmse is not None:
+                best_rmse = test_rmse
+            best_rounded_acc = test_acc
             best_epoch = epoch + 1
-            best_state = linear.state_dict()
+            best_state = clone_state_dict(linear)
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(
-                f"  Epoch {epoch + 1:3d}/{args.epochs} | "
-                f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
-                f"test_acc={test_acc:.4f} {'*' if test_acc == best_acc else ''}"
-            )
+            if scalar_mode:
+                train_acc_str = (
+                    f" train_round_acc={train_acc:.4f}"
+                    if train_acc is not None
+                    else ""
+                )
+                test_acc_str = (
+                    f" test_round_acc={test_acc:.4f}"
+                    if test_acc is not None
+                    else ""
+                )
+                print(
+                    f"  Epoch {epoch + 1:3d}/{args.epochs} | "
+                    f"train_loss={train_loss:.4f} train_mae={train_mae:.4f} "
+                    f"train_rmse={train_rmse:.4f}{train_acc_str} | "
+                    f"test_mae={test_mae:.4f} test_rmse={test_rmse:.4f}"
+                    f"{test_acc_str} {'*' if improved else ''}"
+                )
+            else:
+                print(
+                    f"  Epoch {epoch + 1:3d}/{args.epochs} | "
+                    f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
+                    f"test_acc={test_acc:.4f} {'*' if improved else ''}"
+                )
 
     # Save best model
     os.makedirs(args.output, exist_ok=True)
@@ -497,10 +693,17 @@ def main():
         "embedding_dim": embedding_dim,
         "num_classes": num_classes,
         "label_names": label_names,
+        "label_mode": label_mode,
+        "scalar_loss": args.scalar_loss if scalar_mode else None,
+        "label_min": label_min,
+        "label_max": label_max,
         "task": args.task,
         "embedding_mode": args.embedding_mode,
         "max_sentences_per_text": max_sentences_per_text,
-        "best_test_accuracy": best_acc,
+        "best_test_accuracy": best_acc if not scalar_mode else best_rounded_acc,
+        "best_test_mae": None if best_mae == float("inf") else best_mae,
+        "best_test_rmse": None if best_rmse == float("inf") else best_rmse,
+        "best_rounded_accuracy": best_rounded_acc,
         "best_epoch": best_epoch,
         "encoder_checkpoint": args.checkpoint,
         "config": args.config,
@@ -510,10 +713,15 @@ def main():
     # Save results
     result = {
         "task": args.task,
+        "label_mode": label_mode,
+        "scalar_loss": args.scalar_loss if scalar_mode else None,
         "num_classes": num_classes,
         "train_samples": len(train_texts),
         "test_samples": len(test_texts),
-        "best_test_accuracy": best_acc,
+        "best_test_accuracy": best_acc if not scalar_mode else best_rounded_acc,
+        "best_test_mae": None if best_mae == float("inf") else best_mae,
+        "best_test_rmse": None if best_rmse == float("inf") else best_rmse,
+        "best_rounded_accuracy": best_rounded_acc,
         "best_epoch": best_epoch,
         "epochs": args.epochs,
         "lr": args.lr,
@@ -533,7 +741,16 @@ def main():
     print(f"\n{'='*50}")
     print(f"Results: {args.task} (Linear Probe)")
     print(f"{'='*50}")
-    print(f"  Best test accuracy: {best_acc:.4f} (epoch {best_epoch})")
+    if scalar_mode:
+        print(f"  Best epoch: {best_epoch}")
+        if best_rounded_acc is not None:
+            print(f"  Best rounded accuracy: {best_rounded_acc:.4f}")
+        if best_mae != float("inf"):
+            print(f"  Best test MAE: {best_mae:.4f}")
+        if best_rmse != float("inf"):
+            print(f"  Best test RMSE: {best_rmse:.4f}")
+    else:
+        print(f"  Best test accuracy: {best_acc:.4f} (epoch {best_epoch})")
     print(f"  Saved to {output_path}")
     print(f"{'='*50}")
 
