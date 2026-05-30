@@ -105,11 +105,12 @@ class SentenceJEPAWrapper:
         has_document_weights = any(
             key.startswith("document_transformer.") for key in state_dict
         )
-        if self.embedding_mode == "document" and not has_document_weights:
+        document_modes = {"document", "document_layer_mean"}
+        if self.embedding_mode in document_modes and not has_document_weights:
             raise ValueError(
-                "embedding_mode='document' requires a hierarchical Paragraph-JEPA "
-                "checkpoint with document_transformer weights. Use "
-                "--embedding_mode sentence_mean for older checkpoints."
+                f"embedding_mode={self.embedding_mode!r} requires a hierarchical "
+                "Paragraph-JEPA checkpoint with document_transformer weights. "
+                "Use --embedding_mode sentence_mean for older checkpoints."
             )
         missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
         if missing:
@@ -180,19 +181,29 @@ class SentenceJEPAWrapper:
         )
 
         with autocast_context(self.device, self.use_amp, self.amp_dtype):
-            if self.embedding_mode == "document":
+            if self.embedding_mode in ("document", "document_layer_mean"):
                 emb = self.model.encode_document(
                     input_ids,
                     attention_mask,
                     sentence_mask,
                     normalize=True,
+                    layer_pooling=(
+                        "concat_mean"
+                        if self.embedding_mode == "document_layer_mean"
+                        else "final"
+                    ),
                 )
             else:
                 emb = self.model.encoder(input_ids, attention_mask).squeeze(1)
 
         return emb
 
-    def encode_sentence_mean_batch(self, texts, contextual=False):
+    def encode_sentence_mean_batch(
+        self,
+        texts,
+        contextual=False,
+        layer_pooling="final",
+    ):
         sentence_lists = [self.text_to_sentences(text) for text in texts]
         flat_sentences = [
             sentence
@@ -237,6 +248,7 @@ class SentenceJEPAWrapper:
                     attention_mask,
                     sentence_mask,
                     normalize=True,
+                    layer_pooling=layer_pooling,
                 )
             else:
                 sent_embs = self.model.encoder(input_ids, attention_mask)  # (B, S, D)
@@ -282,7 +294,17 @@ class SentenceJEPAWrapper:
                 if self.embedding_mode == "single":
                     emb = self.encode_single_batch(texts)
                 elif self.embedding_mode == "document":
-                    emb = self.encode_sentence_mean_batch(texts, contextual=True)
+                    emb = self.encode_sentence_mean_batch(
+                        texts,
+                        contextual=True,
+                        layer_pooling="final",
+                    )
+                elif self.embedding_mode == "document_layer_mean":
+                    emb = self.encode_sentence_mean_batch(
+                        texts,
+                        contextual=True,
+                        layer_pooling="concat_mean",
+                    )
                 elif self.embedding_mode == "sentence_mean":
                     emb = self.encode_sentence_mean_batch(texts)
                 else:
@@ -319,12 +341,15 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
         "--embedding_mode",
-        choices=["document", "single", "sentence_mean"],
+        choices=["document", "document_layer_mean", "single", "sentence_mean"],
         default="document",
         help=(
             "document: split text into sentences, contextualize them with the "
-            "document transformer, then normalized mean-pool. sentence_mean: old "
-            "independent sentence mean. single: old first-max_seq_len-token behavior."
+            "final document-transformer layer, then normalized mean-pool. "
+            "document_layer_mean: concatenate all document-transformer layer "
+            "outputs along the sentence axis, then normalized mean-pool. "
+            "sentence_mean: old independent sentence mean. single: old "
+            "first-max_seq_len-token behavior."
         ),
     )
     parser.add_argument(

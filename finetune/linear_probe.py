@@ -143,6 +143,7 @@ def encode_texts_sentence_mean(
     batch_size=64,
     max_sentences=None,
     contextual=False,
+    layer_pooling="final",
 ):
     """Encode split sentences and mean-pool sentence embeddings per example."""
     all_embeddings = []
@@ -201,6 +202,7 @@ def encode_texts_sentence_mean(
                     attention_mask,
                     sentence_mask,
                     normalize=True,
+                    layer_pooling=layer_pooling,
                 )
             else:
                 sentence_encoder = getattr(encoder, "encoder", encoder)
@@ -248,6 +250,19 @@ def encode_texts(
             batch_size,
             max_sentences=max_sentences,
             contextual=True,
+            layer_pooling="final",
+        )
+    if embedding_mode == "document_layer_mean":
+        return encode_texts_sentence_mean(
+            encoder,
+            tokenizer,
+            texts,
+            max_length,
+            device,
+            batch_size,
+            max_sentences=max_sentences,
+            contextual=True,
+            layer_pooling="concat_mean",
         )
     raise ValueError(f"Unknown embedding mode: {embedding_mode}")
 
@@ -417,11 +432,13 @@ def main():
     )
     parser.add_argument(
         "--embedding_mode",
-        choices=["document", "single", "sentence_mean"],
+        choices=["document", "document_layer_mean", "single", "sentence_mean"],
         default="document",
         help=(
             "document: contextual sentence mean from hierarchical Paragraph-JEPA. "
-            "single: one-sequence probe. sentence_mean: independent sentence mean."
+            "document_layer_mean: mean over sentence outputs from all document "
+            "transformer layers. single: one-sequence probe. sentence_mean: "
+            "independent sentence mean."
         ),
     )
     parser.add_argument(

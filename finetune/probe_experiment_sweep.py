@@ -431,7 +431,7 @@ def prepare_batches(
             batch_size,
             pin_memory,
         )
-    if embedding_mode in ("sentence_mean", "document"):
+    if embedding_mode in ("sentence_mean", "document", "document_layer_mean"):
         return prepare_sentence_mean_batches(
             texts,
             tokenizer,
@@ -532,17 +532,22 @@ def encode_prepared_batches(
             sentence_mask = batch["sentence_mask"].to(device, non_blocking=True)
 
             with autocast_context(device, amp_enabled, amp_dtype):
-                if embedding_mode == "document":
+                if embedding_mode in ("document", "document_layer_mean"):
                     if not hasattr(encoder, "encode_document"):
                         raise ValueError(
-                            "embedding_mode='document' requires a hierarchical "
-                            "SentenceJEPA checkpoint."
+                            f"embedding_mode={embedding_mode!r} requires a "
+                            "hierarchical SentenceJEPA checkpoint."
                         )
                     emb = encoder.encode_document(
                         input_ids,
                         attention_mask,
                         sentence_mask,
                         normalize=True,
+                        layer_pooling=(
+                            "concat_mean"
+                            if embedding_mode == "document_layer_mean"
+                            else "final"
+                        ),
                     )
                 else:
                     sentence_encoder = getattr(encoder, "encoder", encoder)
@@ -946,7 +951,7 @@ def main():
     )
     parser.add_argument(
         "--embedding_mode",
-        choices=["document", "single", "sentence_mean"],
+        choices=["document", "document_layer_mean", "single", "sentence_mean"],
         default="document",
     )
     parser.add_argument(

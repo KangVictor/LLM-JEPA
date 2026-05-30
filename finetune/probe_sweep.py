@@ -405,11 +405,13 @@ def main():
     )
     parser.add_argument(
         "--embedding_mode",
-        choices=["document", "single", "sentence_mean"],
+        choices=["document", "document_layer_mean", "single", "sentence_mean"],
         default="document",
         help=(
             "document: contextual sentence mean from hierarchical Paragraph-JEPA. "
-            "single: one-sequence probe. sentence_mean: independent sentence mean."
+            "document_layer_mean: mean over sentence outputs from all document "
+            "transformer layers. single: one-sequence probe. sentence_mean: "
+            "independent sentence mean."
         ),
     )
     parser.add_argument(

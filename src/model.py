@@ -280,7 +280,13 @@ class DocumentTransformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, sentence_embeddings, sentence_mask, position_ids=None):
+    def forward(
+        self,
+        sentence_embeddings,
+        sentence_mask,
+        position_ids=None,
+        return_layer_outputs=False,
+    ):
         """
         Args:
             sentence_embeddings: (B, S, D)
@@ -288,7 +294,8 @@ class DocumentTransformer(nn.Module):
             position_ids: optional (B, S) original sentence positions
 
         Returns:
-            contextual_sentence_embeddings: (B, S, D)
+            contextual_sentence_embeddings: (B, S, D), or a list of (B, S, D)
+                tensors when return_layer_outputs=True.
         """
         B, S, _ = sentence_embeddings.shape
         if S > self.max_sentences:
@@ -309,7 +316,17 @@ class DocumentTransformer(nn.Module):
         x = self.input_proj(sentence_embeddings * visible)
         x = x + self.sentence_pos_emb(position_ids)
 
-        x = self.transformer(x, src_key_padding_mask=~sentence_mask)
+        layer_outputs = []
+        padding_mask = ~sentence_mask
+        for layer in self.transformer.layers:
+            x = layer(x, src_key_padding_mask=padding_mask)
+            if return_layer_outputs:
+                layer_out = self.output_proj(self.norm(x))
+                layer_outputs.append(layer_out * visible)
+
+        if return_layer_outputs:
+            return layer_outputs
+
         x = self.norm(x)
         x = self.output_proj(x)
         return x * visible
@@ -460,12 +477,34 @@ class SentenceJEPA(nn.Module):
         sentence_mask,
         normalize=True,
         return_contextual=False,
+        layer_pooling="final",
     ):
         """Inference path: contextualize all sentences and mean-pool."""
-        contextual = self.encode_contextual(input_ids, attention_mask, sentence_mask)
+        sentence_embeddings = self.encoder(input_ids, attention_mask)
+        if layer_pooling == "final":
+            contextual = self.document_transformer(sentence_embeddings, sentence_mask)
+            pool_input = contextual
+            pool_mask = sentence_mask
+        elif layer_pooling == "concat_mean":
+            layer_outputs = self.document_transformer(
+                sentence_embeddings,
+                sentence_mask,
+                return_layer_outputs=True,
+            )
+            if not layer_outputs:
+                contextual = sentence_embeddings
+                pool_input = contextual
+                pool_mask = sentence_mask
+            else:
+                contextual = layer_outputs[-1]
+                pool_input = torch.cat(layer_outputs, dim=1)
+                pool_mask = sentence_mask.repeat(1, len(layer_outputs))
+        else:
+            raise ValueError(f"Unknown document layer_pooling: {layer_pooling}")
+
         document_embeddings = masked_mean_pool(
-            contextual,
-            sentence_mask,
+            pool_input,
+            pool_mask,
             normalize=normalize,
         )
         if return_contextual:
