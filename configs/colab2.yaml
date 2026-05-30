@@ -1,0 +1,96 @@
+# SentenceJEPA-Small default configuration
+
+# Sentence encoder (BERT-style)
+encoder:
+  num_layers: 4
+  hidden_size: 256
+  embedding_size: 256
+  num_heads: 4
+  ffn_size: 1024
+  projector_hidden_size: 2048
+  max_seq_len: 48
+  vocab_size: 30522  # BERT tokenizer vocab
+  dropout: 0.1
+  freeze: false
+
+# Paragraph-level transformer over sentence embeddings
+document:
+  num_layers: 4
+  hidden_size: 256
+  num_heads: 4
+  ffn_size: 1024
+  dropout: 0.1
+  max_sentences: 20
+
+# Sentence-level predictor
+predictor:
+  num_layers: 6       # LeWM-style stronger predictor
+  hidden_size: 256
+  num_heads: 4
+  ffn_size: 2048
+  projector_hidden_size: 2048
+  dropout: 0.1
+
+# JEPA objective
+objective:
+  mode: "masked"
+  detach_target: false
+
+# Data pipeline
+data:
+  dataset: "wikimedia/wikipedia"
+  config: "20231101.en"
+  local_path: "/content/drive/MyDrive/SentenceJEPA/train"            # set to a directory or file path to use pre-downloaded data
+  streaming: true             # ignored when local_path is set
+  min_sentences: 8
+  max_sentences: 20
+  max_tokens_per_sentence: 48
+  tokenizer: "bert-base-uncased"
+  num_workers: 8
+
+# JEPA masking
+masking:
+  mask_ratio_min: 0.25   # ablation: 0.25 vs 0.40
+  mask_ratio_max: 0.40
+  max_mask_count: 4
+  multi_mask: true        # ablation: true vs false
+  span_masking: true
+  span_len_min: 1
+  span_len_max: 3
+  num_spans_min: 1
+  num_spans_max: 2
+  keep_at_least_one_visible: true
+  combinations_per_sample: 1  # >1 samples multiple mask sets per paragraph
+  val_combinations_per_sample: 1
+
+# SIGReg regularization
+sigreg:
+  enabled: true           # ablation: true vs false
+  document_enabled: false
+  contextual_enabled: true
+  contextual_weight: 1.0
+  knots: 17
+  num_projections: 1024
+  weight: 0.09
+
+# Training
+training:
+  batch_size: 1024
+  lr: 5.0e-5
+  weight_decay: 1.0e-3
+  warmup_steps: 1000
+  epochs: 10
+  precision: "bf16"
+  grad_clip: 1.0
+  val_paragraphs: 500000
+  val_every: 500
+  log_every: 50
+  save_every: 10000
+  checkpoint_dir: "/content/drive/MyDrive/SentenceJEPAModel"
+  resume_from: null
+  seed: 42
+
+# Weights & Biases
+wandb:
+  project: "sentence-jepa"
+  enabled: true
