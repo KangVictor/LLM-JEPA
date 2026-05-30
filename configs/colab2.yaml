@@ -24,7 +24,7 @@ document:
 
 # Sentence-level predictor
 predictor:
-  num_layers: 6       # LeWM-style stronger predictor
+  num_layers: 4       # LeWM-style stronger predictor
   hidden_size: 256
   num_heads: 4
   ffn_size: 2048
