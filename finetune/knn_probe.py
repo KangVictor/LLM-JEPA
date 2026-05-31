@@ -59,6 +59,37 @@ def subset_examples(texts, labels, max_samples, seed):
     return [texts[i] for i in indices], [labels[i] for i in indices]
 
 
+def subset_examples_per_class(texts, labels, samples_per_class, seed):
+    """Sample up to N train examples from each class."""
+    if samples_per_class is None:
+        return texts, labels
+    if samples_per_class < 1:
+        raise ValueError("--train_samples_per_class must be >= 1")
+
+    by_class = {}
+    for idx, label in enumerate(labels):
+        by_class.setdefault(label, []).append(idx)
+
+    generator = torch.Generator().manual_seed(seed)
+    selected = []
+    class_counts = {}
+    for label in sorted(by_class):
+        indices = by_class[label]
+        perm = torch.randperm(len(indices), generator=generator).tolist()
+        keep = [indices[i] for i in perm[:samples_per_class]]
+        selected.extend(keep)
+        class_counts[label] = len(keep)
+
+    selected.sort()
+    min_count = min(class_counts.values()) if class_counts else 0
+    max_count = max(class_counts.values()) if class_counts else 0
+    print(
+        f"Train per-class sample cap: {samples_per_class} "
+        f"({len(class_counts):,} classes, min={min_count}, max={max_count})"
+    )
+    return [texts[i] for i in selected], [labels[i] for i in selected]
+
+
 def as_class_labels(train_labels, test_labels):
     """Convert MTEB labels into discrete class ids for KNN classification."""
     labels = list(train_labels) + list(test_labels)
@@ -199,6 +230,16 @@ def main():
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--max_test_samples", type=int, default=None)
     parser.add_argument(
+        "--train_samples_per_class",
+        type=int,
+        default=None,
+        help=(
+            "Use at most this many training examples per class, similar to "
+            "MTEB's few-shot samples_per_label. Applied before "
+            "--max_train_samples."
+        ),
+    )
+    parser.add_argument(
         "--max_sentences_per_text",
         type=int,
         default=None,
@@ -229,6 +270,12 @@ def main():
     print(f"Loading MTEB task: {args.task}")
     train_texts, train_labels, test_texts, test_labels, label_names = (
         load_mteb_classification_data(args.task)
+    )
+    train_texts, train_labels = subset_examples_per_class(
+        train_texts,
+        train_labels,
+        args.train_samples_per_class,
+        args.seed,
     )
     train_texts, train_labels = subset_examples(
         train_texts, train_labels, args.max_train_samples, args.seed
