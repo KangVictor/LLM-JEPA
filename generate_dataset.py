@@ -548,6 +548,13 @@ def generate_source_shards(
         scanned += 1
         if skipped < existing_count:
             skipped += 1
+            if skipped == 1 or skipped == existing_count or skipped % 100000 == 0:
+                elapsed = max(time.time() - t0, 1e-6)
+                print(
+                    f"  {source_name}: skipped {skipped:,}/{existing_count:,} "
+                    f"existing resume samples ({skipped / elapsed:.1f} samples/s)",
+                    flush=True,
+                )
             continue
 
         paragraph_batch.append(sentences)
