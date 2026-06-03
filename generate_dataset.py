@@ -469,10 +469,10 @@ def generate_source_shards(
     max_tokens = data_cfg["max_tokens_per_sentence"]
 
     existing_count, existing_paths = count_existing_samples(output, source_name)
-    if existing_count > quota:
+    if existing_count >= quota:
         print(
             f"  {source_name}: found {existing_count:,} existing samples, "
-            f"which already exceeds quota {quota:,}."
+            f"which already satisfies quota {quota:,}."
         )
         return {
             "requested": quota,
